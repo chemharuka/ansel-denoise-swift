@@ -23,6 +23,11 @@ keeps the same license.
 `Host/` 下那个文件是 MIT 的——它只 *spawn* 这个 GPL 可执行文件，不链接任何东西。它由宿主
 仓库复制过去使用（或直接编译进宿主），本仓库保留一份作为权威副本。理由见 `LICENSE-SCOPE.md`。
 
+> **改客户端请改这里，然后同步到宿主。** Photons 里实际参与编译的是
+> `Sources/PhotonsExtensions/Denoise/AnselDenoiseClient.swift`，`Vendor/ansel-denoise-swift/`
+> 不参与编译（`Package.swift` 不引用它）。两份内容必须一致——`AnselDenoiseService.swift`
+> （tiling、CFA 相位、羽化、strength 混合）只存在于宿主侧，不在本仓库。
+
 ## 为什么是这个模型
 
 | | ansel | nonlocal-matchfilter |
