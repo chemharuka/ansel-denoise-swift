@@ -6,10 +6,11 @@
 //
 //  Subcommands
 //    info    <model.anselnn>
-//    tile    <model> <in.f32> --width W --height H --a r,g,b --b r,g,b
-//            [--cfa rggb] [--gpu] --out <out.f32>
-//    batch   <model> <in.f32> --tile N --count K --a r,g,b --b r,g,b
-//            [--cfa rggb] [--gpu] --out <out.f32>
+//    image   <model> <in.f32> --width W --height H --a r,g,b --b r,g,b
+//            [--cfa rggb] [--gpu] [--strength S] [--budget-gb G]
+//            [--split CxR] --out <out.f32>
+//        Whole-image entry point: plans for memory, splits the fewest times it can,
+//        feathers the cuts, blends `strength`. Hosts should use this rather than `tile`.
 //    bench   <model.anselnn> [--gpu] [--tiles 64,128,256,512] [--compare-cpu]
 //        Sweep block sizes on one backend, or compare both backends.
 //
@@ -137,6 +138,77 @@ case "bench":
         let cStr = cpu.isFinite ? String(format: "%.1f", cpu) : "-"
         let gStr = gpu.isFinite ? String(format: "%.1f", gpu) : "-"
         print(String(format: "%-6d %10@ %9@ %9@", t, cStr as NSString, gStr as NSString, sp as NSString))
+    }
+
+case "image":
+    // Whole-image entry point. The host hands over a normalized float32 mosaic and gets the same
+    // shape back; everything about fitting it into memory happens here.
+    guard args.count >= 3 else { die("usage: image <model> <in.f32> ...") }
+    guard let w = flag("--width").flatMap(Int.init),
+          let h = flag("--height").flatMap(Int.init),
+          let aStr = flag("--a"), let bStr = flag("--b"),
+          let outPath = flag("--out")
+    else { die("missing --width/--height/--a/--b/--out") }
+
+    let sigmaScale = flag("--sigma-scale").map { parseDoubles($0) } ?? [2.82, 3.94, 2.96]
+    guard sigmaScale.count == 3 else { die("--sigma-scale needs 3 values") }
+    let a = parseDoubles(aStr).enumerated().map { $0.element * sigmaScale[$0.offset] * sigmaScale[$0.offset] }
+    let b = parseDoubles(bStr).enumerated().map { $0.element * sigmaScale[$0.offset] * sigmaScale[$0.offset] }
+    guard a.count == 3, b.count == 3 else { die("--a and --b each need 3 values") }
+
+    let model = try AnselDenoiseModel(contentsOf: URL(fileURLWithPath: args[1]))
+    var engine: MetalConv?
+    if hasFlag("--gpu") { engine = try MetalConv() }
+
+    var request = DenoiseImageRequest(
+        input: URL(fileURLWithPath: args[2]),
+        output: URL(fileURLWithPath: outPath),
+        width: w, height: h,
+        a: a, b: b,
+        sigmaScale: sigmaScale,
+        cfa: flag("--cfa") ?? "rggb",
+        useGPU: hasFlag("--gpu"),
+        strength: flag("--strength").flatMap(Double.init) ?? 0.85,
+        budgetBytes: flag("--budget-gb").flatMap(Double.init).map { Int($0 * 1e9) },
+        forceColumns: nil, forceRows: nil)
+
+    // --split CxR forces a cut pattern; useful for measuring seams and for regression tests.
+    if let s = flag("--split") {
+        let parts = s.lowercased().split(separator: "x")
+        if parts.count == 2, let c = Int(parts[0]), let r = Int(parts[1]) {
+            request.forceColumns = c
+            request.forceRows = r
+        } else {
+            die("--split wants CxR, e.g. 2x1")
+        }
+    }
+
+    let t0 = Date()
+    let result = try DenoiseImageRunner.run(request, model: model, metal: engine) { msg in
+        FileHandle.standardError.write(Data((msg + "\n").utf8))
+    }
+    let ms = Date().timeIntervalSince(t0) * 1000
+
+    if hasFlag("--json") {
+        emitJSON([
+            "pieces": result.pieces,
+            "columns": result.plan.columns,
+            "rows": result.plan.rows,
+            "seams": result.plan.seams,
+            "peakBytes": result.plan.peakBytes,
+            "budgetBytes": result.plan.budgetBytes,
+            "wholeImageBytes": result.plan.wholeImageBytes,
+            "singlePass": result.plan.isSinglePass,
+            "ms": ms,
+            "backend": result.backend,
+            "cfa": request.cfa,
+            "output": outPath,
+        ])
+    } else {
+        FileHandle.standardError.write(Data(String(
+            format: "image %dx%d: %d piece(s) %dx%d, %d seam(s), peak %.2f GB of %.2f GB, %.1f ms\n",
+            w, h, result.pieces, result.plan.columns, result.plan.rows, result.plan.seams,
+            Double(result.plan.peakBytes) / 1e9, Double(result.plan.budgetBytes) / 1e9, ms).utf8))
     }
 
 case "tile", "batch":
