@@ -93,6 +93,60 @@ public struct AnselDenoiseReport: Sendable, Equatable {
     public let cfa: String
 }
 
+/// What the tool says about one DNG-in / DNG-out run.
+///
+/// Only fields the tool actually reports are here. In particular `readSeconds`/`writeSeconds` exist
+/// so a slow run can be attributed without guessing: on 60 MP they are 2.2 s and 0.9 s against
+/// 38.3 s of inference, which is the whole point of moving file IO into the tool.
+public struct AnselDenoiseDNGReport: Sendable, Equatable {
+    public let output: URL
+    public let width: Int
+    public let height: Int
+    /// CFA as the source file states it (tag 33422).
+    public let cfa: String
+    /// CFA the network was told. Differs from `cfa` only when the stored image is larger than its
+    /// `ActiveArea`, or when the caller overrode it.
+    public let mosaicCfa: String
+    public let pieces: Int
+    public let columns: Int
+    public let rows: Int
+    /// Internal cuts that needed feathering. Zero means the frame went through in one pass.
+    public let seams: Int
+    public let seconds: Double
+    public let readSeconds: Double
+    public let inferenceSeconds: Double
+    public let writeSeconds: Double
+    public let backend: String
+    public let outputBytes: Int
+    /// Samples the network produced outside [0,1] and the tool clamped. Non-zero is normal.
+    public let clampedNegatives: Int
+    public let clampedOverOne: Int
+
+    init?(response: [String: Any], output: URL) {
+        func int(_ key: String) -> Int? { (response[key] as? NSNumber)?.intValue }
+        func double(_ key: String) -> Double { (response[key] as? NSNumber)?.doubleValue ?? 0 }
+        guard let width = int("width"), let height = int("height"),
+              let cfa = response["cfa"] as? String, width > 0, height > 0 else { return nil }
+        self.output = output
+        self.width = width
+        self.height = height
+        self.cfa = cfa
+        self.mosaicCfa = response["mosaicCfa"] as? String ?? cfa
+        self.pieces = int("pieces") ?? 1
+        self.columns = int("columns") ?? 1
+        self.rows = int("rows") ?? 1
+        self.seams = int("seams") ?? 0
+        self.seconds = double("seconds")
+        self.readSeconds = double("readSeconds")
+        self.inferenceSeconds = double("inferenceSeconds")
+        self.writeSeconds = double("writeSeconds")
+        self.backend = response["backend"] as? String ?? "unknown"
+        self.outputBytes = int("outputBytes") ?? 0
+        self.clampedNegatives = int("clampedNegatives") ?? 0
+        self.clampedOverOne = int("clampedOverOne") ?? 0
+    }
+}
+
 public struct AnselDenoiseFailure: Error, CustomStringConvertible, Sendable {
     public let code: String
     public let message: String
@@ -160,6 +214,66 @@ public struct AnselDenoiseClient: Sendable {
     public func gpuName() throws -> String? {
         let response = try runJSON(arguments: ["capabilities"])
         return response["gpu"] as? String
+    }
+
+    /// `true` when the tool can take a `.dng` in and write one back — i.e. when the host can stop
+    /// doing the mosaic round trip itself. Checked once per launch.
+    public func supportsDNG() throws -> Bool {
+        let response = try runJSON(arguments: ["capabilities"])
+        guard let features = response["features"] as? [String] else { return false }
+        return features.contains("image-dng")
+    }
+
+    /// Denoise a DNG: **two paths, one JSON object.** The tool reads the RAW, denoises the mosaic,
+    /// and writes a DNG whose geometry and metadata are the source's own.
+    ///
+    /// This is the entry point a host should use. Everything that used to justify the host owning
+    /// the pixels — normalization against the file's black/white levels, tiling, feathered
+    /// reassembly, the writer — is inside the tool, and both sides of it come from one file, so
+    /// they cannot disagree.
+    ///
+    /// On a 60 MP frame this is 42 s in total, of which 2.2 s is reading and 0.9 s writing. The
+    /// old shape (host reads → writes float32 → tool → host reads back → writes DNG) took 350 s,
+    /// with 284 s of that in the host moving samples around.
+    ///
+    /// - Parameters:
+    ///   - input: the source DNG. Its black level, white level and CFA phase are read from it.
+    ///   - output: where to write the denoised DNG. Its parent directory must exist; the tool
+    ///     writes no partial file on failure.
+    public func denoiseImage(model: URL,
+                             input: URL,
+                             output: URL,
+                             options: AnselDenoiseOptions = AnselDenoiseOptions()) throws -> AnselDenoiseDNGReport {
+        precondition(input.pathExtension.lowercased() == "dng", "input must be a .dng")
+        precondition(output.pathExtension.lowercased() == "dng", "output must be a .dng")
+        precondition(options.noiseA.count == 3 && options.noiseB.count == 3,
+                     "noiseA/noiseB must each have 3 channel values")
+
+        var arguments = [
+            "image", model.path, input.path,
+            "--a", options.noiseA.map { String(format: "%.9g", $0) }.joined(separator: ","),
+            "--b", options.noiseB.map { String(format: "%.9g", $0) }.joined(separator: ","),
+            "--sigma-scale", options.sigmaScale.map { String(format: "%.9g", $0) }.joined(separator: ","),
+            "--strength", String(format: "%.9g", options.strength),
+            "--json",
+            "--out", output.path,
+        ]
+        if options.useGPU { arguments.insert("--gpu", at: 3) }
+
+        let response = try runJSON(arguments: arguments)
+        guard let report = AnselDenoiseDNGReport(response: response, output: output) else {
+            throw AnselDenoiseFailure(code: "bad_response",
+                                      message: "image did not report width/height/cfa",
+                                      exitCode: 0)
+        }
+        // The tool exits 0 only after writing, and a missing file is a bug rather than a race — but
+        // a host that renders from this path should not be the first to notice it.
+        guard FileManager.default.fileExists(atPath: output.path) else {
+            throw AnselDenoiseFailure(code: "no_output",
+                                      message: "tool reported success but \(output.path) is missing",
+                                      exitCode: 0)
+        }
+        return report
     }
 
     /// Denoise `count` tiles already packed back-to-back in `input`.

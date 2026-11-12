@@ -5,8 +5,15 @@
 //
 //  This is the entry point a host should use. It owns everything about *fitting an image into
 //  memory* — the memory budget, whether to split, where to cut, how to feather — so the host does
-//  not have to model any of that. The host's whole job becomes: produce a float32 mosaic, run
-//  this, read the float32 back.
+//  not have to model any of that.
+//
+//  Two front doors, one engine
+//  ---------------------------
+//  `run(_:...)` reads and writes `Float32` mosaics, which is what an older host still does.
+//  `denoiseMosaic(...)` takes the array directly, which is what the DNG path needs: the tool reads
+//  the DNG itself, so the mosaic never has to go to disk between decode and inference. Both go
+//  through the same planning, padding, feathering and clamping code below, so the two paths cannot
+//  drift apart in what they do to pixels.
 //
 //  Why the split logic lives here rather than in the host
 //  ----------------------------------------------------
@@ -63,6 +70,20 @@ public struct DenoiseImageResult: Sendable {
     public let milliseconds: Double
     public let backend: String
     public let pieces: Int
+    /// Samples the result held that were below zero *before* the final clamp, and above one.
+    /// Both are counted after the `strength` blend, i.e. on the array a writer would receive.
+    public let clampedNegatives: Int
+    public let clampedOverOne: Int
+    /// Minimum and maximum of the values actually handed to the writer. Never negative after the
+    /// clamp; a test asserting `finalMin >= 0` is what keeps the clamp from being deleted.
+    public let finalMin: Float
+    public let finalMax: Float
+    /// The denoised mosaic, normalized. Same size as the input, row-major.
+    ///
+    /// `run(_:)` writes this to disk and drops it; the DNG path keeps it only long enough to
+    /// quantize. Holding it here instead of re-reading the output file avoids a third pass over
+    /// the image.
+    public let mosaic: [Float]
 }
 
 public enum DenoiseImageError: Error, CustomStringConvertible {
@@ -79,6 +100,7 @@ public enum DenoiseImageError: Error, CustomStringConvertible {
 
 public enum DenoiseImageRunner {
 
+    /// File-to-file entry point: `Float32` mosaic in, `Float32` mosaic out.
     public static func run(_ request: DenoiseImageRequest,
                            model: AnselDenoiseModel,
                            metal: MetalConv?,
@@ -94,6 +116,32 @@ public enum DenoiseImageRunner {
         }
         var mosaic = [Float](repeating: 0, count: W * H)
         mosaic.withUnsafeMutableBytes { inputData.copyBytes(to: $0) }
+
+        let result = try denoiseMosaic(mosaic, width: W, height: H,
+                                       request: request, model: model, metal: metal,
+                                       progress: progress)
+        try result.mosaic.withUnsafeBufferPointer { Data(buffer: $0) }
+            .write(to: request.output)
+        return result
+    }
+
+    /// Memory-resident entry point. Plans, pads, runs the pieces, feathers, blends, clamps.
+    ///
+    /// Used by the DNG path, where the mosaic comes from a decoder rather than a file, and by
+    /// `run(_:)` above. `budgetBytes` is taken literally: a caller that already holds the whole
+    /// mosaic in memory should pass a budget that has that residency subtracted, or the plan will
+    /// think there is more room than there is.
+    public static func denoiseMosaic(_ mosaic: [Float],
+                                     width: Int, height: Int,
+                                     request: DenoiseImageRequest,
+                                     model: AnselDenoiseModel,
+                                     metal: MetalConv?,
+                                     progress: ((String) -> Void)? = nil) throws -> DenoiseImageResult {
+        let W = width, H = height
+        guard W > 0, H > 0 else { throw DenoiseImageError.badInput("empty image") }
+        guard mosaic.count == W * H else {
+            throw DenoiseImageError.badInput("mosaic holds \(mosaic.count) samples, expected \(W * H) for \(W)×\(H)")
+        }
 
         let budget = request.budgetBytes ?? DenoisePlanner.memoryLimit()
         let plan: DenoisePlan
@@ -209,7 +257,10 @@ public enum DenoiseImageRunner {
         }
 
         // Blend toward the input. Applied on normalized values, so black/white levels are the
-        // host's business and cannot drift here.
+        // caller's business and cannot drift here. Note the input is *not* guaranteed to be inside
+        // [0,1]: samples below the black level normalize negative, and a DNG reader will hand those
+        // over as they are. So the blend can pull values back out of range, and the clamp has to
+        // run again afterwards — once, on the array that actually leaves here.
         let s = Float(min(max(request.strength, 0), 1))
         if s < 1 {
             for i in 0..<W * H where wsum[i] > 0 {
@@ -217,13 +268,29 @@ public enum DenoiseImageRunner {
             }
         }
 
-        try result.withUnsafeBufferPointer { Data(buffer: $0) }
-            .write(to: request.output)
+        var negatives = 0, overs = 0
+        var lo = Float.infinity, hi = -Float.infinity
+        for i in 0..<W * H {
+            let v = result[i]
+            if !v.isFinite { result[i] = 0; continue }
+            if v < 0 { negatives += 1; result[i] = 0 }
+            else if v > 1 { overs += 1; result[i] = 1 }
+            let w = result[i]
+            if w < lo { lo = w }
+            if w > hi { hi = w }
+        }
+        if !lo.isFinite { lo = 0 }
+        if !hi.isFinite { hi = 0 }
 
         return DenoiseImageResult(plan: plan,
                                   milliseconds: totalSeconds * 1000,
                                   backend: gpu != nil ? "gpu" : "cpu",
-                                  pieces: plan.pieces.count)
+                                  pieces: plan.pieces.count,
+                                  clampedNegatives: negatives,
+                                  clampedOverOne: overs,
+                                  finalMin: lo,
+                                  finalMax: hi,
+                                  mosaic: result)
     }
 
     /// Drop the padding added on the right and bottom before the forward pass.
