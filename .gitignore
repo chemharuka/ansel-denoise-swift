@@ -2,5 +2,14 @@
 .swiftpm/
 *.xcodeproj
 .DS_Store
-*.anselnn
 /models/
+
+# Model weights are neither GPL nor bound by the training-data licence: upstream's
+# LICENSE-DATA.md §2.2 says the weights are unrestricted ("use, ship, sell or license
+# them however you see fit"). The default variant is committed so a clone can run
+# immediately; the other five are fetched by scripts/fetch-weights.sh and stay untracked.
+#
+# Order matters: the last matching rule wins, so the blanket `*.anselnn` has to come
+# before the negation or the negation is dead.
+*.anselnn
+!weights/denoise-quarter-single-v1.anselnn

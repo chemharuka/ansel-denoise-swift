@@ -77,15 +77,31 @@ $EXE bench MODEL.anselnn --compare-cpu --tiles 256,512,1024
 
 ## 权重
 
-不随本仓库分发（GPL 与体积原因）。从上游 manifest 拉取并校验：
+**许可：权重不是 GPL。** 上游分三件事，权重不在任何一类限制里：
+
+| 对象 | 许可 | 覆盖 |
+|---|---|---|
+| `Sources/` 本仓库代码 | GPL-3.0-or-later | 代码 |
+| `LICENSE-DATA.md`（ATDL-1.1） | 训练**数据** | 仅原始传感器 tile |
+| `.anselnn` 权重 | **都不适用** | 无限制 |
+
+`LICENSE-DATA.md` §2.2 原文：「**The resulting weights are yours**: this license places no
+restriction on them — use, ship, sell or license them however you see fit…」
+
+所以权重放仓库没有许可问题，GPL 义务也**不**延伸到权重（GPL 覆盖的是实现——Swift 移植与
+Metal 内核——不是网络跑的那堆数字）。详见 `weights/README.md`。
+
+`denoise-quarter-single-v1.anselnn`（1.9 MB，默认变体）**已提交**，clone 下来可直接跑测试和
+降噪。其余五个用脚本按 manifest 的 sha256 校验下载（不入库，理由是 100 MB 二进制进 git 历史
+是永久成本，而它只是一次 curl）：
 
 ```bash
-curl -sL -o manifest.json \
-  https://raw.githubusercontent.com/aurelienpierreeng/ansel-denoise/master/models/manifest.json
-# 按 manifest 里的 sha256 下载并校验，例如：
-curl -sL -O https://raw.githubusercontent.com/aurelienpierreeng/ansel-denoise/master/models/denoise-quarter-single-v1.anselnn
-shasum -a 256 denoise-quarter-single-v1.anselnn   # 与 manifest 比对
+./scripts/fetch-weights.sh                 # 全部六个，逐个 sha256 校验
+./scripts/fetch-weights.sh quarter-single  # 单个
+./scripts/fetch-weights.sh --list          # 只看列表
 ```
+
+校验失败的下载文件会被**删除**而不是保留——损坏的权重文件能正常加载，只会安静地产生错误像素。
 
 六个变体：`quarter/half/large` × `single/multi`。**只用 `single`**（`multi` 需要
 superpixel binning，本实现未包含）。
