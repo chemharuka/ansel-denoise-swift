@@ -4,6 +4,14 @@
 .DS_Store
 /models/
 
+# Local working state: agent handoff notes and probe output. The Photons repo has the same
+# `docs/tasks/` + `local/` convention and ignores both; without these rules a subagent's report
+# gets committed by an unrelated `git add -A`, which is how it happened once already.
+/local/
+/docs/tasks/
+__pycache__/
+*.pyc
+
 # Model weights are neither GPL nor bound by the training-data licence: upstream's
 # LICENSE-DATA.md §2.2 says the weights are unrestricted ("use, ship, sell or license
 # them however you see fit"). The default variant is committed so a clone can run
