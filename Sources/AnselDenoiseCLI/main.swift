@@ -30,7 +30,7 @@ func parseDoubles(_ s: String) -> [Double] {
 
 let args = Array(CommandLine.arguments.dropFirst())
 guard let cmd = args.first else {
-    die("usage: ansel-denoise-swift <info|tile|batch|bench> ...")
+    die("usage: ansel-denoise-swift <image|info|tile|batch|bench|capabilities> ...")
 }
 
 func flag(_ name: String) -> String? {
@@ -307,7 +307,7 @@ case "capabilities":
     // so a mismatched bundled binary fails loudly instead of producing bad pixels.
     var info: [String: Any] = [
         "tool": ["name": "ansel-denoise-swift", "protocol": 1],
-        "features": ["tile", "batch", "bench", "info", "gpu"],
+        "features": ["image", "tile", "batch", "bench", "info", "gpu"],
         "cfaPatterns": ["rggb", "bggr", "grbg", "gbrg"],
         "inputLayout": "float32-planar-mosaic",
         "outputLayout": "float32-planar-mosaic",
