@@ -13,6 +13,6 @@ let package = Package(
     targets: [
         .target(name: "AnselDenoise"),
         .executableTarget(name: "AnselDenoiseCLI", dependencies: ["AnselDenoise"]),
-        .testTarget(name: "AnselDenoiseTests", dependencies: ["AnselDenoise"]),
+        .testTarget(name: "AnselDenoiseTests", dependencies: ["AnselDenoise", "AnselDenoiseCLI"]),
     ]
 )

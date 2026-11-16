@@ -43,6 +43,15 @@ func flag(_ name: String) -> String? {
 
 let hasFlag: (String) -> Bool = { name in args.contains(name) }
 
+/// Where the host left the security-scoped bookmarks for the files it let the user pick.
+///
+/// A child process does not inherit the parent's sandbox extensions, so the host passes
+/// bookmarks rather than bytes. `--file-grants` is the documented way in; the environment
+/// variable is honoured too because existing hosts already set it, and a host that has not
+/// been rebuilt should not silently lose its grants.
+let fileGrantsPath = flag("--file-grants")
+    ?? ProcessInfo.processInfo.environment["PHOTONS_HELPER_BOOKMARKS"]
+
 func readFloats(_ path: String, expected: Int) -> [Float] {
     let data = try! Data(contentsOf: URL(fileURLWithPath: path))
     guard data.count == expected * MemoryLayout<Float>.size else {
@@ -114,6 +123,19 @@ func runMain(_ body: () throws -> Void) -> Never {
         }
         die("error: \(message)")
     }
+}
+
+// The host's grants are taken out before any file is opened: `image` reads the RAW itself, so
+// without them the read below fails with EPERM inside a sandbox and with nothing at all outside
+// one. `fileGrantsPath == nil` (the ordinary non-sandboxed run) makes this an empty no-op.
+//
+// A top-level binding lives until the process exits, and every path here ends in `exit()`, so the
+// grants are held for exactly as long as they are needed and released by teardown.
+let grants: SandboxFileGrants
+do {
+    grants = try SandboxFileGrants(manifestPath: fileGrantsPath)
+} catch {
+    die("error: cannot read file grants from \(fileGrantsPath ?? "-"): \(error)")
 }
 
 runMain {
