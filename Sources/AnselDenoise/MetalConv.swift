@@ -65,6 +65,29 @@ public final class MetalConv {
         public var count: Int { width * height * channels }
     }
 
+    /// A convolution whose weights and bias have already been packed into GPU
+    /// buffers.
+    ///
+    /// Packed once per immutable model layer, then shared by every tile and image
+    /// size. Explicit ownership avoids a global name-keyed cache mixing two
+    /// different models: the caller decides which `PreparedConvolution` belongs to
+    /// which layer of which model, and there is no way for two models to collide.
+    ///
+    /// The shape is captured at `prepare` time, so a prepared convolution is only
+    /// valid for the layer it was made from — pass it back with the same `w`/`b`.
+    public struct PreparedConvolution {
+        fileprivate let weights: MTLBuffer
+        fileprivate let bias: MTLBuffer?
+        fileprivate let inC: Int
+        fileprivate let outC: Int
+        fileprivate let kh: Int
+        fileprivate let kw: Int
+
+        /// Channels in / out and kernel extent, for callers that need to plan
+        /// shapes without unpacking the buffers.
+        public var shape: (inC: Int, outC: Int, kh: Int, kw: Int) { (inC, outC, kh, kw) }
+    }
+
     public init(device: MTLDevice? = nil) throws {
         guard let dev = device ?? MTLCreateSystemDefaultDevice() else {
             throw MetalConvError.noDevice
@@ -158,16 +181,26 @@ public final class MetalConv {
 
     // MARK: - ops
 
-    public func conv(_ input: Tensor, w: AnselWeights, b: [Float]?,
-                     kind: ConvKind, cmd: MTLCommandBuffer) throws -> Tensor {
-        let (kh, kw, stride, pad) = (w.kh, w.kw, kind.stride, kind.pad)
-        let outH = (input.height + 2 * pad - kh) / stride + 1
-        let outW = (input.width + 2 * pad - kw) / stride + 1
-        let outC = w.outC
-
-        let out = try makeTensor(width: outW, height: outH, channels: outC)
+    /// Pack a convolution's weights (and bias) into GPU buffers once.
+    ///
+    /// Everything `conv` needs that depends only on the weights is computed here,
+    /// so a hot loop over tiles pays the repack cost exactly once per layer.
+    public func prepare(w: AnselWeights, b: [Float]?) throws -> PreparedConvolution {
         let (wb, _) = try weightBuffer(w)
         let (bb, _) = try biasBuffer(b)
+        return PreparedConvolution(weights: wb, bias: bb,
+                                   inC: w.inC, outC: w.outC, kh: w.kh, kw: w.kw)
+    }
+
+    /// Convolve using weights already packed by `prepare(w:b:)`.
+    public func conv(_ input: Tensor, prepared p: PreparedConvolution,
+                     kind: ConvKind, cmd: MTLCommandBuffer) throws -> Tensor {
+        let (kh, kw, stride, pad) = (p.kh, p.kw, kind.stride, kind.pad)
+        let outH = (input.height + 2 * pad - kh) / stride + 1
+        let outW = (input.width + 2 * pad - kw) / stride + 1
+        let outC = p.outC
+
+        let out = try makeTensor(width: outW, height: outH, channels: outC)
 
         let pipe = kind == .same3x3 ? convSame3x3 : (kind == .point1x1 ? convPoint1x1 : convDown2x2)
         guard let enc = cmd.makeComputeCommandEncoder() else {
@@ -175,8 +208,8 @@ public final class MetalConv {
         }
         enc.setComputePipelineState(pipe)
         enc.setBuffer(input.buffer, offset: 0, index: 0)
-        enc.setBuffer(wb, offset: 0, index: 1)
-        if let bb { enc.setBuffer(bb, offset: 0, index: 2) }
+        enc.setBuffer(p.weights, offset: 0, index: 1)
+        if let bb = p.bias { enc.setBuffer(bb, offset: 0, index: 2) }
         enc.setBuffer(out.buffer, offset: 0, index: 3)
 
         var dims = SIMD4<Int32>(Int32(input.width), Int32(input.height), Int32(input.channels),
@@ -186,7 +219,7 @@ public final class MetalConv {
         enc.setBytes(&dims, length: MemoryLayout<SIMD4<Int32>>.size, index: 4)
         enc.setBytes(&dims2, length: MemoryLayout<SIMD4<Int32>>.size, index: 5)
         enc.setBytes(&str, length: MemoryLayout<SIMD2<Int32>>.size, index: 6)
-        var hasBias = Int32(b == nil ? 0 : 1)
+        var hasBias = Int32(p.bias == nil ? 0 : 1)
         enc.setBytes(&hasBias, length: MemoryLayout<Int32>.size, index: 7)
 
         let tg = MTLSize(width: 16, height: 16, depth: 1)
@@ -194,6 +227,15 @@ public final class MetalConv {
         enc.dispatchThreadgroups(grid, threadsPerThreadgroup: tg)
         enc.endEncoding()
         return out
+    }
+
+    /// One-shot convenience: prepare and convolve in a single call.
+    ///
+    /// Kept for callers that convolve once with throwaway weights and existing
+    /// tests. Anything on a hot path should `prepare` once and reuse.
+    public func conv(_ input: Tensor, w: AnselWeights, b: [Float]?,
+                     kind: ConvKind, cmd: MTLCommandBuffer) throws -> Tensor {
+        try conv(input, prepared: prepare(w: w, b: b), kind: kind, cmd: cmd)
     }
 
     public func geluInPlace(_ t: Tensor, cmd: MTLCommandBuffer) throws {
