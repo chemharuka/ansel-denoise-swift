@@ -58,6 +58,7 @@ metadata is the source's. Nothing about the picture's geometry is the host's bus
 | `--json` | Machine-readable summary on stdout. Progress goes to stderr. |
 | `--width`, `--height` | *Optional.* If given they are **checked** against the file; a mismatch is an error, never a silent preference for either. |
 | `--cfa` | Override the CFA phase. Experimental — the file is authoritative. |
+| `--dual-raw` | Write **both** mosaics into one file: IFD0 is the original (pre-denoise) raw, and `330 SubIFDs` points at the denoised one. See below. |
 
 Response:
 
@@ -90,6 +91,53 @@ The fields a host needs to decide anything:
 | `finalMin` | Minimum of the array handed to the writer. **Always ≥ 0**; a negative here would become a sample below the black level. |
 | `sourceBelowBlack` | How many source samples were already below the black level. Tells "the clamp had nothing to do" apart from "the clamp ate signal". |
 | `outputBytes` / `tiles` | The DNG that was written. |
+| `hasAlternate` / `alternate` | `--dual-raw` only. `hasAlternate: true` and `alternate: "denoised"` mean the file carries a second full-res raw; `alternateBytes` / `alternateTiles` size it. Without the flag they read `false` / `null` / `0`. |
+
+### `--dual-raw`: two raws in one DNG
+
+`--dual-raw` writes the original and the denoised mosaic into a single full-resolution DNG instead
+of only the denoised one. Layout, in file order:
+
+```
+header │ IFD0 (preview) │ payload │ SubIFD[0] original │ payload │ SubIFD[1] denoised │ payload │
+       │ EXIF │ GPS │ original tiles │ denoised tiles │ preview
+```
+
+IFD0 is the source's **preview page** (`NewSubfileType = 1`, strips, not CFA) and owns the EXIF/GPS
+pointers; the two raws hang off its `330 SubIFDs`:
+
+| SubIFD | contents | `NewSubfileType` |
+|---|---|---|
+| `[0]` | **original**, un-denoised mosaic, bit-identical to the source's samples, plus the full metadata set | 0 |
+| `[1]` | **denoised** mosaic, plus the level/CFA/crop tags and `270 ImageDescription` (`denoised alternate: ansel-denoise strength=0.85`) | 0 |
+
+Order and placement were measured, not assumed: `CIRAWFilter` resolves a multi-raw DNG by scanning
+`SubIFDs` and taking the **first** entry whose `NewSubfileType` is 0; IFD0 is only consulted when
+there is none. Two files identical apart from which layer sat in which slot both decoded the first
+`SubIFDs` raw. So:
+
+- a standard reader sees the **original** — `CIRAWFilter` renders the output identical to the input,
+  pixel for pixel;
+- the denoised layer is reachable by following `330`, or by *promoting* it: point `SubIFDs[0]` at the
+  alternate IFD and set the count to 1 (or swap the two IFDs' `324`/`325` if the promoted layer
+  should be described by the original's metadata instead). A promoted alternate renders exactly the
+  denoised picture a single-raw run writes.
+
+What `SubIFDs[1]` repeats and what it does not: it carries `254` `256` `257` `258` `259` `262` `270`
+`277` `284` `322`–`325` `339` plus the tags that describe its own samples (`33421` / `33422` CFA,
+`50710` `50711`, `50713` / `50714` / `50717` levels, `50719` / `50720` crop, `50829 ActiveArea`) —
+without those a promoted copy renders at the sensor size with default levels. It does **not** repeat
+the develop-look data (`50721`/`50722` matrices, `50728 AsShotNeutral`, `50938`/`50939` hue-sat maps,
+`50981`/`50982` look table, `51022` opcodes, `51041` NoiseProfile), the EXIF/GPS pointers, `700 XMP`
+or `50740 DNGPrivateData`: ImageIO merges those across the file, and a second copy makes it apply the
+correction twice (measured: a dual file whose two layers were identical then rendered differently
+from its own source).
+
+Cost: roughly **1.7×** the file size — both layers are full resolution and lossless-JPEG encoded,
+each with its own Huffman tables (the denoised layer's narrower residual distribution gets its own,
+so it usually encodes a little smaller). The JSON reports `hasAlternate: true`,
+`alternate: "denoised"`, `alternateBytes` and `alternateTiles`. Without the flag nothing changes:
+no `330`, one raw, byte-identical output to previous releases.
 
 ### What the tool guarantees about the output DNG
 

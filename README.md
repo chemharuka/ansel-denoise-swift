@@ -45,10 +45,29 @@ That is the whole host-facing path: one DNG in, one DNG out, one JSON object on 
 | `--strength S` | `out = in + S·(denoised − in)`, in the normalized domain. Default 0.85. |
 | `--a`, `--b` | Per-channel Poisson-Gaussian noise model, `Var = a·x + b` on [0,1]. Per-camera values. |
 | `--sigma-scale` | Per-channel sigma calibration. Default `2.82,3.94,2.96`. |
+| `--dual-raw` | Keep both raws in one file: preview in IFD0, `SubIFDs = [original, denoised]`. Roughly 1.7× the file size. |
 
 The JSON summary carries what a host needs to decide anything: `seconds` split into
 `readSeconds`/`inferenceSeconds`/`writeSeconds`, `tiles`, `pieces`/`seams`/`singlePass`,
 `clampedNegatives`, `finalMin`, plus the CFA pattern and levels it used.
+
+`--dual-raw` writes one DNG containing two full-resolution CFA raws, in the shape a camera DNG
+uses: **IFD0 is the preview page**, and `330 SubIFDs` lists the **original** un-denoised mosaic
+(bit-identical to the source's samples) first and the **denoised** mosaic second, tagged
+`270 ImageDescription = "denoised alternate: ansel-denoise strength=…"`.
+
+The order matters and was measured, not assumed: `CIRAWFilter` resolves a multi-raw DNG by scanning
+`SubIFDs` and taking the **first** entry whose `NewSubfileType` is 0 — IFD0 is only consulted when
+there is none. So the original has to be `SubIFDs[0]`, and a file that put it in IFD0 would hand the
+*denoised* layer to the system decoder. As written, `CIRAWFilter` renders the output identically to
+the input (verified pixel for pixel), and promoting `SubIFDs[1]` renders exactly the denoised
+picture.
+
+To surface the denoised layer, follow `330`, or *promote* it (point `SubIFDs[0]` at the alternate and
+set the count to 1); the alternate repeats the level/CFA/crop tags so a promoted copy is a
+self-consistent raw. Profile, colour-matrix and opcode tags are deliberately **not** repeated — a
+second copy makes ImageIO apply them twice and changes the rendering of the whole file. Off by
+default; without the flag the output is byte-for-byte what earlier releases wrote.
 
 Other subcommands — `info`, `tile`, `batch`, `bench`, `capabilities`, `models` — exist for
 experiments, benchmarking and host negotiation. Hosts should use `image`.

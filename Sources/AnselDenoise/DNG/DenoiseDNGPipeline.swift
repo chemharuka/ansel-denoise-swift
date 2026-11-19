@@ -57,6 +57,9 @@ public struct DenoiseDNGRequest {
     /// How many tiles feed the writer's Huffman statistics.
     public var tableSampleTiles: Int
     public var writerGrid: DNGRawWriter.TileGrid
+    /// Write both mosaics into one file: IFD0 = the original (pre-denoise) samples, and IFD0's
+    /// `SubIFDs` points at the denoised layer. Default `false` keeps the old single-raw file.
+    public var dualRaw: Bool
 
     public init(model: AnselDenoiseModel, metal: MetalConv?,
                 input: URL, output: URL,
@@ -67,7 +70,8 @@ public struct DenoiseDNGRequest {
                 forceColumns: Int? = nil, forceRows: Int? = nil,
                 expectedWidth: Int? = nil, expectedHeight: Int? = nil,
                 tableSampleTiles: Int = 12,
-                writerGrid: DNGRawWriter.TileGrid = DNGRawWriter.TileGrid()) {
+                writerGrid: DNGRawWriter.TileGrid = DNGRawWriter.TileGrid(),
+                dualRaw: Bool = false) {
         self.model = model
         self.metal = metal
         self.input = input
@@ -83,6 +87,7 @@ public struct DenoiseDNGRequest {
         self.expectedHeight = expectedHeight
         self.tableSampleTiles = tableSampleTiles
         self.writerGrid = writerGrid
+        self.dualRaw = dualRaw
     }
 }
 
@@ -129,6 +134,13 @@ public struct DenoiseDNGResult {
     /// normalizes negative. Reported so a review can tell "the clamp had nothing to do" apart from
     /// "the clamp ate real signal".
     public let sourceBelowBlack: Int
+
+    /// `--dual-raw`: the file carries the original mosaic in IFD0 and the denoised one in an IFD
+    /// reachable through `330 SubIFDs`.
+    public let hasAlternate: Bool
+    /// Compressed bytes of the alternate layer's tiles (0 when there is none).
+    public let alternateByteCount: Int
+    public let alternateTileCount: Int
 }
 
 public enum DenoiseDNGError: Error, CustomStringConvertible {
@@ -267,10 +279,30 @@ public enum DenoiseDNGPipeline {
 
         let written: DNGRawWriter.Result
         do {
-            written = try DNGRawWriter.write(samples: quantized, width: width, height: height,
-                                             from: request.input, to: request.output,
-                                             grid: request.writerGrid,
-                                             tableSampleTiles: request.tableSampleTiles)
+            if request.dualRaw {
+                // The primary layer is `decoded.samples` verbatim — the mosaic as the file stored
+                // it, before normalization, denoising or the clamp. Round-tripping it through
+                // normalize→denormalize would reintroduce a ±1 code error for no reason, and the
+                // whole point of the original layer is that it is bit-identical to the source.
+                //
+                // `decoded` is already resident for the whole call (the planner's residency figure
+                // counts this 2 B/px), so keeping it alive until here costs no extra peak.
+                written = try DNGRawWriter.write(
+                    primary: DNGRawWriter.Layer(samples: decoded.samples),
+                    alternate: DNGRawWriter.Layer(
+                        samples: quantized,
+                        label: "denoised alternate: ansel-denoise strength="
+                            + String(format: "%.2f", request.strength)),
+                    width: width, height: height,
+                    from: request.input, to: request.output,
+                    grid: request.writerGrid,
+                    tableSampleTiles: request.tableSampleTiles)
+            } else {
+                written = try DNGRawWriter.write(samples: quantized, width: width, height: height,
+                                                 from: request.input, to: request.output,
+                                                 grid: request.writerGrid,
+                                                 tableSampleTiles: request.tableSampleTiles)
+            }
         } catch let error as DNGRawWriter.WriteError {
             throw DenoiseDNGError.write(error.description)
         } catch {
@@ -282,7 +314,10 @@ public enum DenoiseDNGPipeline {
         let writeSeconds = Date().timeIntervalSince(writeStart)
 
         progress?("wrote \(request.output.lastPathComponent) (\(written.byteCount) bytes, "
-                  + "\(written.tileCount) tiles) in " + String(format: "%.2f s", writeSeconds))
+                  + "\(written.tileCount) tiles"
+                  + (written.hasAlternate
+                     ? " + \(written.alternateTileCount) alternate tiles" : "")
+                  + ") in " + String(format: "%.2f s", writeSeconds))
 
         return DenoiseDNGResult(
             width: width, height: height,
@@ -305,6 +340,9 @@ public enum DenoiseDNGPipeline {
             clampedNegatives: denoised.clampedNegatives,
             clampedOverOne: denoised.clampedOverOne,
             finalMin: finalMin, finalMax: finalMax,
-            sourceBelowBlack: belowBlack)
+            sourceBelowBlack: belowBlack,
+            hasAlternate: written.hasAlternate,
+            alternateByteCount: written.alternateByteCount,
+            alternateTileCount: written.alternateTileCount)
     }
 }

@@ -7,7 +7,7 @@
 //  Subcommands
 //    info    <model.anselnn>
 //    image   <model> <in.dng|in.f32> [--width W --height H] [--a r,g,b] [--b r,g,b]
-//            [--cfa rggb] [--gpu] [--strength S] [--budget-gb G]
+//            [--cfa rggb] [--gpu] [--strength S] [--budget-gb G] [--dual-raw]
 //            [--split CxR] --out <out.dng|out.f32> [--json]
 //        Whole-image entry point: plans for memory, splits the few times it can,
 //        feathers the cuts, blends `strength`. Hosts should use this rather than `tile`.
@@ -253,7 +253,8 @@ case "image":
             forceColumns: forceColumns, forceRows: forceRows,
             // Given, these are checked against the file — never preferred over it.
             expectedWidth: flag("--width").flatMap(Int.init),
-            expectedHeight: flag("--height").flatMap(Int.init))
+            expectedHeight: flag("--height").flatMap(Int.init),
+            dualRaw: hasFlag("--dual-raw"))
 
         let result = try DenoiseDNGPipeline.run(request, progress: progress)
 
@@ -294,6 +295,11 @@ case "image":
                 "finalMin": Double(result.finalMin),
                 "finalMax": Double(result.finalMax),
                 "sourceBelowBlack": result.sourceBelowBlack,
+                // --dual-raw: IFD0 is the original mosaic, the denoised one hangs off SubIFDs.
+                "hasAlternate": result.hasAlternate,
+                "alternate": result.hasAlternate ? "denoised" : NSNull(),
+                "alternateBytes": result.alternateByteCount,
+                "alternateTiles": result.alternateTileCount,
             ])
         } else {
             let summary = [
@@ -305,13 +311,23 @@ case "image":
                 + " + infer \(String(format: "%.2f", result.inferenceSeconds)) s"
                 + " + write \(String(format: "%.2f", result.writeSeconds)) s"
                 + " = \(String(format: "%.2f", result.seconds)) s (\(result.backend))",
-            ].joined(separator: "\n") + "\n"
+                result.hasAlternate
+                    ? "  dual-raw: IFD0 original + \(result.alternateTileCount) alternate tiles"
+                      + " (\(result.alternateByteCount) bytes) under SubIFDs"
+                    : nil,
+            ].compactMap { $0 }.joined(separator: "\n") + "\n"
             FileHandle.standardError.write(Data(summary.utf8))
         }
         exit(0)
     }
 
     // MARK: float32 mosaic path (unchanged behaviour)
+
+    // A raw layer only exists inside a DNG; the float32 path writes bare samples and has nowhere to
+    // put a second one. Refuse rather than silently ignoring the flag.
+    guard !hasFlag("--dual-raw") else {
+        die("--dual-raw needs .dng on both sides (input \(inPath), output \(outPath))")
+    }
 
     guard let w = flag("--width").flatMap(Int.init),
           let h = flag("--height").flatMap(Int.init),
@@ -458,7 +474,7 @@ case "capabilities":
     // so a mismatched bundled binary fails loudly instead of producing bad pixels.
     var info: [String: Any] = [
         "tool": ["name": "ansel-denoise-swift", "protocol": 2],
-        "features": ["image", "image-dng", "tile", "batch", "bench", "info", "gpu"],
+        "features": ["image", "image-dng", "image-dng-dual-raw", "tile", "batch", "bench", "info", "gpu"],
         "cfaPatterns": ["rggb", "bggr", "grbg", "gbrg"],
         "inputLayout": "float32-planar-mosaic",
         "outputLayout": "float32-planar-mosaic",

@@ -53,24 +53,31 @@ struct SourceDNG {
         }
         ifd0 = try TIFFReader.readIFD(data, at: Int(ifd0Offset))
 
-        // A capture DNG usually keeps its RAW in the first SubIFD; our own writer puts it in IFD0
-        // (the preview becomes IFD1). Accept both, and prefer whichever actually carries the CFA
-        // photometric (32803) — that is the one whose tags describe the samples.
-        if let subIFDs = ifd0[330]?.value, subIFDs.count >= 4,
-           let rawOffset = TIFFReader.u32(subIFDs, 0) {
-            let candidate = try TIFFReader.readIFD(data, at: Int(rawOffset))
-            if candidate[262]?.firstUInt32 == 32803 {
-                raw = candidate
-            } else if ifd0[262]?.firstUInt32 == 32803 {
-                raw = ifd0
-            } else {
-                raw = candidate
+        // A capture DNG keeps its RAW in a SubIFD, and so does a dual-raw file this writer
+        // produces. Resolution order, matching what ImageIO was measured doing: scan `330` and take
+        // the **first** entry that is an uncompressed-dimension CFA raw (subfiletype 0); only when
+        // there is none does IFD0 count — and then it must be CFA, because a preview page is not.
+        //
+        // Getting this order wrong is silent and expensive: prefer IFD0 and a dual-raw file hands
+        // back its preview (or, with the layout reversed, the denoised layer) as "the raw".
+        var rawIFD: [UInt16: TIFFEntry]? = nil
+        if let subIFDs = ifd0[330]?.value, subIFDs.count >= 4 {
+            var index = 0
+            while let offset = TIFFReader.u32(subIFDs, index) {
+                let candidate = try TIFFReader.readIFD(data, at: Int(offset))
+                if candidate[262]?.firstUInt32 == 32803,
+                   (candidate[254]?.firstUInt32 ?? 0) == 0 {
+                    rawIFD = candidate
+                    break
+                }
+                index += 1
             }
-        } else if ifd0[262]?.firstUInt32 == 32803 {
-            raw = ifd0
-        } else {
-            throw ReadError.noRawSubIFD
         }
+        if rawIFD == nil, ifd0[262]?.firstUInt32 == 32803 {
+            rawIFD = ifd0
+        }
+        guard let rawIFD else { throw ReadError.noRawSubIFD }
+        raw = rawIFD
 
         if let pointer = ifd0[34665]?.value, let offset = TIFFReader.u32(pointer, 0) {
             exif = try TIFFReader.readIFD(data, at: Int(offset))
