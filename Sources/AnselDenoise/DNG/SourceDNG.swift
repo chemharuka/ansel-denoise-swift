@@ -55,13 +55,13 @@ struct SourceDNG {
 
         // A capture DNG keeps its RAW in a SubIFD, and so does a dual-raw file this writer
         // produces. Resolution order, matching what ImageIO was measured doing: scan `330` and take
-        // the **first** entry that is an uncompressed-dimension CFA raw (subfiletype 0); only when
-        // there is none does IFD0 count — and then it must be CFA, because a preview page is not.
+        // the **first** entry that is a CFA raw with subfiletype 0; only when there is none does IFD0
+        // count — and then it must be CFA, because a preview page is not.
         //
         // Getting this order wrong is silent and expensive: prefer IFD0 and a dual-raw file hands
         // back its preview (or, with the layout reversed, the denoised layer) as "the raw".
         var rawIFD: [UInt16: TIFFEntry]? = nil
-        if let subIFDs = ifd0[330]?.value, subIFDs.count >= 4 {
+        if let subIFDs = ifd0[330]?.value, !subIFDs.isEmpty {
             var index = 0
             while let offset = TIFFReader.u32(subIFDs, index) {
                 let candidate = try TIFFReader.readIFD(data, at: Int(offset))
