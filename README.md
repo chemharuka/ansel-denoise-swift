@@ -50,7 +50,7 @@ That is the whole host-facing path: one DNG in, one DNG out, one JSON object on 
 | `--taper-knee lo,hi` | Where that taper starts and ends, in linear RAW brightness. Default `0.05,0.25`. |
 | `--shadow-taper q` | The mirror at the floor; default knees `0.002,0.02`. |
 | `--look nlmf` | The whole conditioning Photons' nonlocal denoiser uses: measured curve, `auto` strength, both tapers. |
-| `--dump-field P` | Write `P.i.f32` / `P.d.f32` / `P.json` — the normalized input, the final field, and what produced them. |
+| `--dump-field P` | Write `P.i.f32` / `P.d.f32` / `P.field.json` — the normalized input, the final field, and what produced them. |
 | `--dual-raw` | Keep both raws in one file: preview in IFD0, `SubIFDs = [original, denoised]`. Roughly 1.7× the file size. |
 
 The JSON summary carries what a host needs to decide anything: `seconds` split into

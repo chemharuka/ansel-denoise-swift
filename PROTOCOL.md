@@ -58,7 +58,7 @@ metadata is the source's. Nothing about the picture's geometry is the host's bus
 | `--taper q` / `--taper-knee lo,hi` | Give up `q` of the blend weight towards the highlights (`0`, the default, keeps it). Knees default `0.05,0.25`. |
 | `--shadow-taper q` / `--shadow-knee lo,hi` | The mirror at the floor; knees default `0.002,0.02`. |
 | `--look nlmf` | The conditioning Photons' nonlocal denoiser uses, so the two engines can be compared: `--estimate-noise`, `--sigma-scale 1,1,1`, `--strength auto`, `--taper 0.18 --taper-knee 0.05,0.25`, `--shadow-taper 0.50 --shadow-knee 0.002,0.02`. Explicit flags still win. |
-| `--dump-field PREFIX` | Debug door: `PREFIX.i.f32` (normalized input), `PREFIX.d.f32` (final field), `PREFIX.json` (curve, weight, taper). |
+| `--dump-field PREFIX` | Debug door: `PREFIX.i.f32` (normalized input), `PREFIX.d.f32` (final field), `PREFIX.field.json` (curve, weight, taper). |
 | `--budget-gb` | Memory ceiling override. Omit to derive it from installed RAM (2/3, or 50 % below 12 GB). |
 | `--split CxR` | Force a cut pattern. For measuring seams. |
 | `--gpu` | Use Metal. Without it, CPU (roughly 30× slower). |

@@ -422,7 +422,7 @@ public enum DenoiseDNGPipeline {
                 obj["noise"] = ["a": model.a, "b": model.b, "blocks": model.blocks]
             }
             let data = try JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])
-            try data.write(to: URL(fileURLWithPath: prefix + ".json"))
+            try data.write(to: URL(fileURLWithPath: prefix + ".field.json"))
         } catch {
             throw DenoiseDNGError.write("dump field: \(error)")
         }
