@@ -135,7 +135,8 @@ per-brightness strength *inversion* of the network, which is a different feature
 - Client: `Host/Photons/AnselDenoiseClient.swift` — **MIT**, because it only spawns the process
   and parses JSON. It is copied into Photons as
   `Sources/PhotonsExtensions/Denoise/AnselDenoiseClient.swift`; edit it here first and sync.
-  Tiling, feathering and the strength blend are product logic and live on the Photons side, not here.
+  The host passes two paths and one policy — `--look nlmf` by default, or `.classic` with pinned
+  coefficients — and the tool owns the file, the tiling, the noise model and the blend.
 - Protocol: `PROTOCOL.md` (JSON fields, exit codes, what the output DNG is guaranteed to preserve).
 - Install: `./scripts/install-to-photons.sh` (→ `/opt/homebrew/bin`), or `--in-app` for
   `Photons.app/Contents/Resources/bin`.

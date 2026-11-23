@@ -17,6 +17,65 @@
 
 import Foundation
 
+// MARK: - Child process lifetime (451)
+
+/// 451 — 「降噪到一半杀掉 app」 leaves the `ansel-denoise-swift` / `hdrmerge-swift` child running: a
+/// `SIGKILL`ed host cannot signal it, and the child then finishes writing its hidden temp file.
+/// This registry does the one thing a normal quit can do — terminate what we started.
+///
+/// It is **not** a process-group change and it does not try to survive `SIGKILL`; that is the
+/// startup sweep's job (`InterruptedWorkSweep`). The registry exists so
+/// `applicationWillTerminate` can ask the live `Process` objects to stop before the app goes away.
+public final class ChildProcessRegistry: @unchecked Sendable {
+    public static let shared = ChildProcessRegistry()
+
+    private let lock = NSLock()
+    private var handles: [ObjectIdentifier: ChildProcessHandle] = [:]
+
+    private init() {}
+
+    /// Start tracking a launched child. The returned handle is released with `release(_:)` when the
+    /// call that owns the process is done; until then it is retained here so a quit hook can find it.
+    func track(_ process: Process) -> ChildProcessHandle {
+        let handle = ChildProcessHandle(process)
+        lock.lock()
+        handles[ObjectIdentifier(handle)] = handle
+        lock.unlock()
+        return handle
+    }
+
+    func release(_ handle: ChildProcessHandle) {
+        lock.lock()
+        handles.removeValue(forKey: ObjectIdentifier(handle))
+        lock.unlock()
+    }
+
+    /// Best-effort `terminate()` for every child this process launched and has not finished waiting
+    /// for. Called from `applicationWillTerminate`; safe to call more than once.
+    public func terminateAll() {
+        lock.lock()
+        let live = Array(handles.values)
+        lock.unlock()
+        for handle in live { handle.terminateIfRunning() }
+    }
+}
+
+final class ChildProcessHandle: @unchecked Sendable {
+    let process: Process
+
+    init(_ process: Process) {
+        self.process = process
+    }
+
+    func terminateIfRunning() {
+        if process.isRunning { process.terminate() }
+    }
+
+    deinit {
+        terminateIfRunning()
+    }
+}
+
 // MARK: - Public model
 
 /// Which trained network to run.
@@ -49,15 +108,27 @@ public enum AnselDenoiseVariant: String, Sendable, CaseIterable {
     }
 }
 
+/// Which conditioning the tool is asked to use.
+public enum AnselDenoiseLook: String, Sendable, Equatable, CaseIterable {
+    /// Let the tool measure **this** frame's Poisson-Gaussian curve and derive the blend weight
+    /// and the brightness tapers itself (`--look nlmf`): the same conditioning Photons' nonlocal
+    /// denoiser runs, so the two engines hand back comparable results.
+    ///
+    /// Why this is the default: the shipped `noiseA`/`noiseB` are one camera's numbers. On an SL3
+    /// at ISO 100 they over-state sigma by ~6x once `sigmaScale` is applied, which flattens the
+    /// shadows; the measured curve costs ~3 s and removes that guesswork entirely.
+    case nlmf
+    /// Send the caller's `noiseA`/`noiseB`/`sigmaScale`/`strength` verbatim — the pre-`--look`
+    /// contract, kept so an experiment (or an older tool binary) can still pin every number.
+    case classic
+}
+
 public struct AnselDenoiseOptions: Sendable, Equatable {
     public var variant: AnselDenoiseVariant = .quarter
-    /// Tile edge in mosaic pixels. Must be a multiple of 16 (the network halves resolution
-    /// `depth = 4` times, so anything smaller or misaligned collapses the bottleneck to 1×1).
-    public var tileSize: Int = 256
-    /// Context margin between tiles, in pixels. Ansel's measured receptive field decays to ~1e-6
-    /// of peak at r = 32 and to zero by 96; 48 is their shipped value. A smaller overlap leaves
-    /// faint seams that a single-tile test will never reveal.
-    public var overlap: Int = 48
+    /// Conditioning passed to the tool. `.nlmf` (default) sends `--look nlmf` and none of the
+    /// numbers below; `.classic` sends them. The float32-mosaic entry point always sends the
+    /// numbers: that path exists for experiments that pin every input.
+    public var look: AnselDenoiseLook = .nlmf
     /// CFA at the mosaic's top-left, row-major, e.g. "rggb".
     public var cfa: String = "rggb"
     /// Per-channel Poisson-Gaussian coefficients such that `Var = a·x + b` on values normalized
@@ -75,19 +146,36 @@ public struct AnselDenoiseOptions: Sendable, Equatable {
     /// `out = original + strength·(denoised − original)`, applied in the same normalized domain as
     /// the input, so it cannot disturb black/white levels.
     ///
-    /// 0.85 is what Ansel ships: enough to visibly clean up, little enough that texture survives.
+    /// 0.85 was what Ansel ships — enough to visibly clean up, little enough that texture survives.
     /// Note this is **not** the same knob as `sigmaScale`. Sigma tells the network how much noise
     /// to expect (it re-runs inference and decides what to remove); strength only decides how much
     /// of the answer to keep. Lowering strength puts original noise back along with the detail.
-    public var strength: Double = 0.85
+    ///
+    /// 396 — **the default is 0.50**, per the user's own call (「模型降噪的默认强度修改为0.50，即
+    /// `--strength 0.50`」). At 0.85 the tool over-corrects: the residual is *cleaner* than the
+    /// original texture, which reads as plastic on skin and foliage. 0.50 leaves more of the
+    /// original grain in place. Measured on `L1030433.dng` by §386's dark-patch
+    /// adjacent-difference variance, both numbers are printed by
+    /// `AnselDenoiseStrength396Tests`; the value is a **default only** — the range check and the
+    /// CLI parsing are untouched, so a caller that passes `strength:` explicitly still gets it.
+    ///
+    /// 口径修正（覆盖 §396 ①）：这条只在 `look == .classic` 时被发出去。默认的 `.nlmf` 由工具按
+    /// 本帧测得的 σ 自己定力度（0.70–0.85），所以 app 的默认路径不再发 `--strength 0.50`。
+    public var strength: Double = 0.50
 
     public init() {}
 }
 
 public struct AnselDenoiseReport: Sendable, Equatable {
     public let output: URL
-    public let tiles: Int
-    public let tileSize: Int
+    /// How many pieces the image was handed to the network in. 1 means a single pass, no seams.
+    public let pieces: Int
+    public let columns: Int
+    public let rows: Int
+    public let seams: Int
+    public let singlePass: Bool
+    /// Bytes the largest single forward pass was expected to need.
+    public let peakBytes: Int
     public let milliseconds: Double
     public let backend: String
     public let cfa: String
@@ -246,19 +334,26 @@ public struct AnselDenoiseClient: Sendable {
                              options: AnselDenoiseOptions = AnselDenoiseOptions()) throws -> AnselDenoiseDNGReport {
         precondition(input.pathExtension.lowercased() == "dng", "input must be a .dng")
         precondition(output.pathExtension.lowercased() == "dng", "output must be a .dng")
-        precondition(options.noiseA.count == 3 && options.noiseB.count == 3,
-                     "noiseA/noiseB must each have 3 channel values")
+        // With `--look nlmf` the host sends no coefficients at all; requiring them would make the
+        // default configuration trap on its own precondition.
+        precondition(options.look == .nlmf || (options.noiseA.count == 3 && options.noiseB.count == 3),
+                     "noiseA/noiseB must each have 3 channel values when look == .classic")
 
-        var arguments = [
-            "image", model.path, input.path,
-            "--a", options.noiseA.map { String(format: "%.9g", $0) }.joined(separator: ","),
-            "--b", options.noiseB.map { String(format: "%.9g", $0) }.joined(separator: ","),
-            "--sigma-scale", options.sigmaScale.map { String(format: "%.9g", $0) }.joined(separator: ","),
-            "--strength", String(format: "%.9g", options.strength),
-            "--json",
-            "--out", output.path,
-        ]
-        if options.useGPU { arguments.insert("--gpu", at: 3) }
+        var arguments = ["image", model.path, input.path]
+        if options.useGPU { arguments.append("--gpu") }
+        switch options.look {
+        case .nlmf:
+            // The tool measures the curve from the file, derives the weight from it and applies
+            // the same brightness tapers the nonlocal path uses. Nothing about this frame's noise
+            // is guessed on the host side — `--a/--b` are not sent at all.
+            arguments += ["--look", "nlmf"]
+        case .classic:
+            arguments += ["--a", Self.csv(options.noiseA),
+                          "--b", Self.csv(options.noiseB),
+                          "--sigma-scale", Self.csv(options.sigmaScale),
+                          "--strength", String(format: "%.9g", options.strength)]
+        }
+        arguments += ["--json", "--out", output.path]
 
         let response = try runJSON(arguments: arguments)
         guard let report = AnselDenoiseDNGReport(response: response, output: output) else {
@@ -276,41 +371,58 @@ public struct AnselDenoiseClient: Sendable {
         return report
     }
 
-    /// Denoise `count` tiles already packed back-to-back in `input`.
+    /// Denoise a whole mosaic in one call.
     ///
-    /// The caller owns tiling: this tool works on a flat float32 buffer of
-    /// `count × tileSize²` normalized mosaic values and returns the same shape. Doing the tiling
-    /// (and the feathered reassembly) outside keeps the GPL component ignorant of image layout
-    /// and lets the host reuse its own overlap logic.
-    public func denoiseBatch(model: URL,
-                             inputTiles: URL,
-                             count: Int,
+    /// This entry point always sends explicit `--a/--b` (whatever `look` says): it exists for
+    /// experiments and benchmarks that pin every input, and its caller already holds the numbers.
+    ///
+    /// Everything about fitting the image into memory happens on the other side of the process
+    /// boundary: the tool decides whether the frame goes through in one pass or has to be cut, how
+    /// many pieces that needs, where the cuts go, and how to feather them. This side stays a
+    /// transport — write float32, run, read float32.
+    ///
+    /// That placement is deliberate. Splitting exists because of *that implementation's* memory
+    /// profile (0.64 GB per megapixel), so hard-coding a piece count here would mean two programs
+    /// agreeing on a number that changes whenever those kernels change.
+    ///
+    /// The tool removes the artefact that motivated this design: the network denoises less
+    /// aggressively near an input edge, so tile borders used to leave visible structure. A single
+    /// pass over 60 MP is also faster (55.8 s vs 77.9 s as 1426 tiles) because tiling spends about
+    /// a third of its work on overlap that is then blended away.
+    ///
+    /// - Parameters:
+    ///   - input: raw float32, `width × height`, normalized to [0,1], row-major.
+    ///   - output: same shape written here.
+    public func denoiseImage(model: URL,
+                             input: URL,
+                             width: Int,
+                             height: Int,
                              output: URL,
                              options: AnselDenoiseOptions = AnselDenoiseOptions()) throws -> AnselDenoiseReport {
-        precondition(count > 0, "tile count must be positive")
+        precondition(width > 0 && height > 0, "image dimensions must be positive")
         precondition(options.noiseA.count == 3 && options.noiseB.count == 3,
                      "noiseA/noiseB must each have 3 channel values")
 
         var arguments = [
-            "batch", model.path, inputTiles.path,
-            "--tile", String(options.tileSize),
-            "--count", String(count),
+            "image", model.path, input.path,
+            "--width", String(width),
+            "--height", String(height),
             "--a", options.noiseA.map { String(format: "%.9g", $0) }.joined(separator: ","),
             "--b", options.noiseB.map { String(format: "%.9g", $0) }.joined(separator: ","),
             "--sigma-scale", options.sigmaScale.map { String(format: "%.9g", $0) }.joined(separator: ","),
             "--cfa", options.cfa.lowercased(),
+            "--strength", String(format: "%.9g", options.strength),
             "--json",
             "--out", output.path,
         ]
         if options.useGPU { arguments.insert("--gpu", at: 3) }
 
         let response = try runJSON(arguments: arguments)
-        guard let tiles = response["tiles"] as? Int,
-              let ms = response["ms"] as? Double,
+        guard let ms = response["ms"] as? Double,
               let backend = response["backend"] as? String,
               let cfa = response["cfa"] as? String else {
             throw AnselDenoiseFailure(code: "bad_response",
-                                      message: "batch did not report tiles/ms/backend/cfa",
+                                      message: "image run did not report ms/backend/cfa",
                                       exitCode: 0)
         }
         guard FileManager.default.fileExists(atPath: output.path) else {
@@ -318,12 +430,20 @@ public struct AnselDenoiseClient: Sendable {
                                       message: "tool reported success but \(output.path) is missing",
                                       exitCode: 0)
         }
-        return AnselDenoiseReport(output: output, tiles: tiles,
-                                  tileSize: response["tileSize"] as? Int ?? options.tileSize,
+        return AnselDenoiseReport(output: output,
+                                  pieces: response["pieces"] as? Int ?? 1,
+                                  columns: response["columns"] as? Int ?? 1,
+                                  rows: response["rows"] as? Int ?? 1,
+                                  seams: response["seams"] as? Int ?? 0,
+                                  singlePass: response["singlePass"] as? Bool ?? true,
+                                  peakBytes: response["peakBytes"] as? Int ?? 0,
                                   milliseconds: ms, backend: backend, cfa: cfa)
     }
 
-    // MARK: - process plumbing
+    /// Comma-separated, at the precision the CLI parses back without rounding drift.
+    private static func csv(_ values: [Double]) -> String {
+        values.map { String(format: "%.9g", $0) }.joined(separator: ",")
+    }
 
     private func runJSON(arguments: [String]) throws -> [String: Any] {
         var env = ProcessInfo.processInfo.environment
@@ -346,6 +466,9 @@ public struct AnselDenoiseClient: Sendable {
                                       message: "cannot launch \(executableURL.path): \(error)",
                                       exitCode: nil)
         }
+        // 451 — registered only after a successful launch, released once this call stops waiting.
+        let tracked = ChildProcessRegistry.shared.track(process)
+        defer { ChildProcessRegistry.shared.release(tracked) }
 
         // Drain stderr concurrently: a full pipe would deadlock the child.
         var stderrData = Data()
