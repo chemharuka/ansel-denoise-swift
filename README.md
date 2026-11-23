@@ -42,9 +42,15 @@ That is the whole host-facing path: one DNG in, one DNG out, one JSON object on 
 | `--out PATH` | Output DNG. Required. |
 | `--gpu` | Run on Metal (≈30× faster than CPU). |
 | `--json` | One JSON summary on stdout; progress goes to stderr. |
-| `--strength S` | `out = in + S·(denoised − in)`, in the normalized domain. Default 0.85. |
+| `--strength S` | `out = in + S·(denoised − in)`, in the normalized domain. Default 0.85. `auto` derives it from the noise curve. |
 | `--a`, `--b` | Per-channel Poisson-Gaussian noise model, `Var = a·x + b` on [0,1]. Per-camera values. |
-| `--sigma-scale` | Per-channel sigma calibration. Default `2.82,3.94,2.96`. |
+| `--sigma-scale` | Per-channel sigma calibration. Default `2.82,3.94,2.96`; `1,1,1` with `--estimate-noise`. |
+| `--estimate-noise` | Measure the curve from this file instead of trusting `--a`/`--b`. |
+| `--taper q` | Give up `q` of the blend weight towards the highlights (see below). |
+| `--taper-knee lo,hi` | Where that taper starts and ends, in linear RAW brightness. Default `0.05,0.25`. |
+| `--shadow-taper q` | The mirror at the floor; default knees `0.002,0.02`. |
+| `--look nlmf` | The whole conditioning Photons' nonlocal denoiser uses: measured curve, `auto` strength, both tapers. |
+| `--dump-field P` | Write `P.i.f32` / `P.d.f32` / `P.json` — the normalized input, the final field, and what produced them. |
 | `--dual-raw` | Keep both raws in one file: preview in IFD0, `SubIFDs = [original, denoised]`. Roughly 1.7× the file size. |
 
 The JSON summary carries what a host needs to decide anything: `seconds` split into
@@ -69,8 +75,60 @@ self-consistent raw. Profile, colour-matrix and opcode tags are deliberately **n
 second copy makes ImageIO apply them twice and changes the rendering of the whole file. Off by
 default; without the flag the output is byte-for-byte what earlier releases wrote.
 
+`noise` measures a file without denoising it: the same decode, normalization and estimator
+`image` uses, so the sigma it prints is the sigma a run would condition on.
+
+```
+ansel-denoise-swift noise shot.dng            # plane-by-plane a/b, sigma(0.05), derived strength
+ansel-denoise-swift noise shot.dng --json
+```
+
 Other subcommands — `info`, `tile`, `batch`, `bench`, `capabilities`, `models` — exist for
 experiments, benchmarking and host negotiation. Hosts should use `image`.
+
+## Conditioning: the measured curve, and the blend that goes with it
+
+`--a/--b` default to one camera's numbers. On a different sensor, or the same one at a different
+ISO, they are wrong in a way nothing reports. The curve is a property of the file, so
+`--estimate-noise` measures it: diagonal differences inside each CFA plane, MAD → sigma, 15th
+percentile per brightness bin, `Var = a·x + b` by least squares, intercept doubled to compensate for
+the tone curve's shadow lift. That estimator is the same one `nonlocal-matchfilter-swift` (Photons'
+other denoise engine) uses, so both condition on the same sigma field for the same frame.
+
+A measured curve is already in the mosaic domain, so the `2.82/3.94/2.96` profile calibration must
+**not** be applied on top — that factor exists to lift profile values, which are fitted on
+demosaiced pixels. `--look nlmf` sets `--sigma-scale 1,1,1` for this reason.
+
+`--strength auto` maps green sigma at 5 % brightness onto 0.70–0.85 (log-linear, clamped). The
+blend is then reduced per pixel towards the ends of the tonal range:
+
+```
+s(x) = s · (1 − q_hi·smoothstep(x, hiLo, hiHi)) · (1 − q_lo·(1 − smoothstep(x, loLo, loHi)))
+```
+
+`--look nlmf` uses `q_hi = 0.18` over 0.05–0.25 and `q_lo = 0.50` below 0.002 — the settings
+Photons' nonlocal path was measured with. With no taper the factor is exactly 1, so the old
+frame-wide blend is reproduced bit for bit.
+
+**Measured parity** (Leica SL3 60 MP, quarter model, paired 64×64 blocks of the green plane,
+high-frequency retention = MAD of first differences out/in):
+
+| block brightness | ansel `--look nlmf` | nonlocal | ratio |
+|---|---|---|---|
+| 0.000–0.002 | 0.579 | 0.583 | 0.99 |
+| 0.002–0.005 | 0.565 | 0.571 | 0.99 |
+| 0.005–0.010 | 0.468 | 0.478 | 0.98 |
+| 0.010–0.020 | 0.367 | 0.383 | 0.96 |
+| 0.020–0.040 | 0.378 | 0.417 | 0.91 |
+| 0.040–0.080 | 0.520 | 0.521 | 1.00 |
+| 0.080–0.160 | 0.498 | 0.514 | 0.97 |
+| 0.160–0.320 | 0.564 | 0.546 | 1.03 |
+
+That is ISO 3200 (`L1030546`), the regime this module is used in: every bin within 9 %, most within
+4 %, at the same blend weight and the same sigma. On a base-ISO frame the two engines still differ in
+the bright bins — the ansel network has less gain there, so it keeps 20–30 % more high-frequency
+content at full strength — and that difference is texture, not grain. Matching it would need a
+per-brightness strength *inversion* of the network, which is a different feature, not a taper.
 
 ## Photons side
 

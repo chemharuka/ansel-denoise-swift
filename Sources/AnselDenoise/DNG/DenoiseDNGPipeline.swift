@@ -47,6 +47,13 @@ public struct DenoiseDNGRequest {
     /// a mismatch between the two is exactly the failure mode that produces a checkerboard.
     public var cfaOverride: String?
     public var strength: Double
+    /// Derive the blend weight from the measured curve instead of taking `strength`.
+    public var autoStrength: Bool
+    /// Per-pixel reduction of the blend towards the extremes of the tonal range.
+    public var taper: BlendTaper
+    /// Measure the noise curve from the file's own mosaic.
+    public var estimateNoise: Bool
+    public var checkerboardNoise: Bool
     public var budgetBytes: Int?
     public var forceColumns: Int?
     public var forceRows: Int?
@@ -60,18 +67,30 @@ public struct DenoiseDNGRequest {
     /// Write both mosaics into one file: IFD0 = the original (pre-denoise) samples, and IFD0's
     /// `SubIFDs` points at the denoised layer. Default `false` keeps the old single-raw file.
     public var dualRaw: Bool
+    /// Debug door: write `<prefix>.i.f32` (the normalized mosaic the network saw) and
+    /// `<prefix>.d.f32` (the blended result) plus a `.json` sidecar of the noise model and blend.
+    ///
+    /// A render is not evidence about the data: a developed TIFF has been through a tone curve and
+    /// the decoder's own noise reduction, so "the shadows lost detail" can mean three things there.
+    /// Comparing two runs in this domain answers the question the render cannot.
+    public var dumpFieldPrefix: String?
 
     public init(model: AnselDenoiseModel, metal: MetalConv?,
                 input: URL, output: URL,
                 a: [Double], b: [Double],
                 cfaOverride: String? = nil,
                 strength: Double = 0.85,
+                autoStrength: Bool = false,
+                taper: BlendTaper = .identity,
+                estimateNoise: Bool = false,
+                checkerboardNoise: Bool = false,
                 budgetBytes: Int? = nil,
                 forceColumns: Int? = nil, forceRows: Int? = nil,
                 expectedWidth: Int? = nil, expectedHeight: Int? = nil,
                 tableSampleTiles: Int = 12,
                 writerGrid: DNGRawWriter.TileGrid = DNGRawWriter.TileGrid(),
-                dualRaw: Bool = false) {
+                dualRaw: Bool = false,
+                dumpFieldPrefix: String? = nil) {
         self.model = model
         self.metal = metal
         self.input = input
@@ -80,6 +99,10 @@ public struct DenoiseDNGRequest {
         self.b = b
         self.cfaOverride = cfaOverride
         self.strength = strength
+        self.autoStrength = autoStrength
+        self.taper = taper
+        self.estimateNoise = estimateNoise
+        self.checkerboardNoise = checkerboardNoise
         self.budgetBytes = budgetBytes
         self.forceColumns = forceColumns
         self.forceRows = forceRows
@@ -88,6 +111,7 @@ public struct DenoiseDNGRequest {
         self.tableSampleTiles = tableSampleTiles
         self.writerGrid = writerGrid
         self.dualRaw = dualRaw
+        self.dumpFieldPrefix = dumpFieldPrefix
     }
 }
 
@@ -141,6 +165,15 @@ public struct DenoiseDNGResult {
     /// Compressed bytes of the alternate layer's tiles (0 when there is none).
     public let alternateByteCount: Int
     public let alternateTileCount: Int
+
+    /// The measured noise curve, when `estimateNoise` asked for one.
+    public let noiseModel: NoiseEstimateModel?
+    /// Blend weight actually applied before the tapers.
+    public let strength: Double
+    /// Green-plane sigma at 5 % brightness that `autoStrength` keyed on.
+    public let sigma: Double
+    /// Per-pixel reduction applied to `strength`.
+    public let taper: BlendTaper
 }
 
 public enum DenoiseDNGError: Error, CustomStringConvertible {
@@ -254,6 +287,10 @@ public enum DenoiseDNGPipeline {
             cfa: mosaicCFA,
             useGPU: request.metal != nil,
             strength: request.strength,
+            autoStrength: request.autoStrength,
+            taper: request.taper,
+            estimateNoise: request.estimateNoise,
+            checkerboardNoise: request.checkerboardNoise,
             budgetBytes: budget,
             forceColumns: request.forceColumns, forceRows: request.forceRows)
 
@@ -263,6 +300,12 @@ public enum DenoiseDNGPipeline {
                                                             model: request.model,
                                                             metal: request.metal,
                                                             progress: progress)
+        if let prefix = request.dumpFieldPrefix {
+            try dumpField(prefix: prefix, input: mosaic, output: denoised.mosaic,
+                          width: width, height: height, cfa: mosaicCFA,
+                          normalization: normalization, autoStrength: request.autoStrength,
+                          denoised: denoised)
+        }
         mosaic = []                                     // release before quantizing
         let inferenceSeconds = Date().timeIntervalSince(inferenceStart)
 
@@ -343,6 +386,45 @@ public enum DenoiseDNGPipeline {
             sourceBelowBlack: belowBlack,
             hasAlternate: written.hasAlternate,
             alternateByteCount: written.alternateByteCount,
-            alternateTileCount: written.alternateTileCount)
+            alternateTileCount: written.alternateTileCount,
+            noiseModel: denoised.noiseModel,
+            strength: denoised.strength,
+            sigma: denoised.sigma,
+            taper: denoised.taper)
+    }
+
+    /// Write the two fields and a sidecar of what produced them. See `dumpFieldPrefix`.
+    static func dumpField(prefix: String, input: [Float], output: [Float],
+                          width: Int, height: Int, cfa: String,
+                          normalization: MosaicNormalization,
+                          autoStrength: Bool,
+                          denoised: DenoiseImageResult) throws {
+        func write(_ values: [Float], _ path: String) throws {
+            try values.withUnsafeBufferPointer { Data(buffer: $0) }
+                .write(to: URL(fileURLWithPath: path))
+        }
+        do {
+            try write(input, prefix + ".i.f32")
+            try write(output, prefix + ".d.f32")
+            var obj: [String: Any] = [
+                "width": width, "height": height, "cfa": cfa,
+                "black": normalization.blackByPhase, "white": normalization.white,
+                "strength": denoised.strength, "sigma": denoised.sigma,
+                "autoStrength": autoStrength,
+                "taper": ["highlight": denoised.taper.highlight,
+                          "highlightLow": denoised.taper.highlightLow,
+                          "highlightHigh": denoised.taper.highlightHigh,
+                          "shadow": denoised.taper.shadow,
+                          "shadowLow": denoised.taper.shadowLow,
+                          "shadowHigh": denoised.taper.shadowHigh],
+            ]
+            if let model = denoised.noiseModel {
+                obj["noise"] = ["a": model.a, "b": model.b, "blocks": model.blocks]
+            }
+            let data = try JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])
+            try data.write(to: URL(fileURLWithPath: prefix + ".json"))
+        } catch {
+            throw DenoiseDNGError.write("dump field: \(error)")
+        }
     }
 }

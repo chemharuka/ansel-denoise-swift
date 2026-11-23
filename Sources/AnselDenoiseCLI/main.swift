@@ -7,8 +7,10 @@
 //  Subcommands
 //    info    <model.anselnn>
 //    image   <model> <in.dng|in.f32> [--width W --height H] [--a r,g,b] [--b r,g,b]
-//            [--cfa rggb] [--gpu] [--strength S] [--budget-gb G] [--dual-raw]
-//            [--split CxR] --out <out.dng|out.f32> [--json]
+//            [--cfa rggb] [--gpu] [--strength S|auto] [--estimate-noise] [--look nlmf]
+//            [--taper q] [--taper-knee lo,hi] [--shadow-taper q] [--shadow-knee lo,hi]
+//            [--budget-gb G] [--dual-raw] [--dump-field PREFIX] [--split CxR]
+//            --out <out.dng|out.f32> [--json]
 //        Whole-image entry point: plans for memory, splits the few times it can,
 //        feathers the cuts, blends `strength`. Hosts should use this rather than `tile`.
 //        The format is chosen by extension: `.dng` on the input means the tool reads the RAW
@@ -16,6 +18,9 @@
 //        cross the process boundary. Anything else is the older float32-mosaic path.
 //    bench   <model.anselnn> [--gpu] [--tiles 64,128,256,512] [--compare-cpu]
 //        Sweep block sizes on one backend, or compare both backends.
+//    noise   <in.dng> [--cfa rggb] [--noise-sample checkerboard] [--json]
+//        Measure the frame's Poisson-Gaussian curve and print it. No inference: this is the
+//        sigma the denoiser would condition on, and the weight it would derive from it.
 //
 
 import Foundation
@@ -207,7 +212,22 @@ case "image":
         die("input and output must be the same format: got \(inPath) → \(outPath)")
     }
 
-    let sigmaScale = flag("--sigma-scale").map { parseDoubles($0) } ?? [2.82, 3.94, 2.96]
+    // `--look nlmf` sets the whole conditioning the way Photons' nonlocal denoiser runs it, so the
+    // two engines hand back results that can be compared: the frame's own measured curve, a weight
+    // derived from that curve, and the same per-pixel tapers. Explicit flags still win.
+    let look = flag("--look")
+    if let look, look != "nlmf" && look != "ansel" { die("--look wants nlmf or ansel, got \(look)") }
+    let nlmfLook = look == "nlmf"
+
+    let sigmaScale: [Double]
+    if let s = flag("--sigma-scale") {
+        sigmaScale = parseDoubles(s)
+    } else {
+        // A measured curve is already in the mosaic domain; the 2.82/3.94/2.96 calibration exists
+        // only to lift *profile* values (fitted on demosaiced pixels) into that domain, and applying
+        // it twice would condition the network on 3-4x the real noise.
+        sigmaScale = nlmfLook ? [1, 1, 1] : [2.82, 3.94, 2.96]
+    }
     guard sigmaScale.count == 3 else { die("--sigma-scale needs 3 values") }
 
     // The DNG path can be called with no noise model at all, in which case it uses the same
@@ -219,6 +239,36 @@ case "image":
     guard aRaw.count == 3, bRaw.count == 3 else { die("--a and --b each need 3 values") }
     let a = aRaw.enumerated().map { $0.element * sigmaScale[$0.offset] * sigmaScale[$0.offset] }
     let b = bRaw.enumerated().map { $0.element * sigmaScale[$0.offset] * sigmaScale[$0.offset] }
+
+    let estimateNoise = hasFlag("--estimate-noise") || nlmfLook
+    let checkerboardNoise = flag("--noise-sample").map { $0 == "checkerboard" } ?? nlmfLook
+
+    var strength = 0.85
+    var autoStrength = nlmfLook
+    if let s = flag("--strength") {
+        if s.lowercased() == "auto" {
+            autoStrength = true
+        } else if let v = Double(s) {
+            strength = v
+            autoStrength = false
+        } else {
+            die("--strength wants a number or 'auto', got \(s)")
+        }
+    }
+
+    var taper = nlmfLook ? BlendTaper.nlmf : BlendTaper.identity
+    if let q = flag("--taper").flatMap(Double.init) { taper.highlight = q }
+    if let knee = flag("--taper-knee").map(parseDoubles) {
+        guard knee.count == 2 else { die("--taper-knee wants lo,hi") }
+        taper.highlightLow = knee[0]
+        taper.highlightHigh = knee[1]
+    }
+    if let q = flag("--shadow-taper").flatMap(Double.init) { taper.shadow = q }
+    if let knee = flag("--shadow-knee").map(parseDoubles) {
+        guard knee.count == 2 else { die("--shadow-knee wants lo,hi") }
+        taper.shadowLow = knee[0]
+        taper.shadowHigh = knee[1]
+    }
 
     let model = try AnselDenoiseModel(contentsOf: URL(fileURLWithPath: args[1]))
     var engine: MetalConv?
@@ -248,13 +298,18 @@ case "image":
             output: URL(fileURLWithPath: outPath),
             a: a, b: b,
             cfaOverride: flag("--cfa"),
-            strength: flag("--strength").flatMap(Double.init) ?? 0.85,
+            strength: strength,
+            autoStrength: autoStrength,
+            taper: taper,
+            estimateNoise: estimateNoise,
+            checkerboardNoise: checkerboardNoise,
             budgetBytes: budgetBytes,
             forceColumns: forceColumns, forceRows: forceRows,
             // Given, these are checked against the file — never preferred over it.
             expectedWidth: flag("--width").flatMap(Int.init),
             expectedHeight: flag("--height").flatMap(Int.init),
-            dualRaw: hasFlag("--dual-raw"))
+            dualRaw: hasFlag("--dual-raw"),
+            dumpFieldPrefix: flag("--dump-field"))
 
         let result = try DenoiseDNGPipeline.run(request, progress: progress)
 
@@ -300,6 +355,20 @@ case "image":
                 "alternate": result.hasAlternate ? "denoised" : NSNull(),
                 "alternateBytes": result.alternateByteCount,
                 "alternateTiles": result.alternateTileCount,
+                // Conditioning: the measured curve (when asked for) and the weight it produced.
+                "estimateNoise": estimateNoise,
+                "noise": result.noiseModel.map {
+                    ["a": $0.a, "b": $0.b, "blocks": $0.blocks, "seconds": $0.seconds]
+                } ?? NSNull(),
+                "autoStrength": autoStrength,
+                "strength": result.strength,
+                "sigma": result.sigma,
+                "taper": ["highlight": result.taper.highlight,
+                          "highlightLow": result.taper.highlightLow,
+                          "highlightHigh": result.taper.highlightHigh,
+                          "shadow": result.taper.shadow,
+                          "shadowLow": result.taper.shadowLow,
+                          "shadowHigh": result.taper.shadowHigh],
             ])
         } else {
             let summary = [
@@ -311,6 +380,9 @@ case "image":
                 + " + infer \(String(format: "%.2f", result.inferenceSeconds)) s"
                 + " + write \(String(format: "%.2f", result.writeSeconds)) s"
                 + " = \(String(format: "%.2f", result.seconds)) s (\(result.backend))",
+                "  strength \(String(format: "%.2f", result.strength))"
+                + (autoStrength ? " (derived)" : "")
+                + ", sigma(0.05) \(String(format: "%.5f", result.sigma))",
                 result.hasAlternate
                     ? "  dual-raw: IFD0 original + \(result.alternateTileCount) alternate tiles"
                       + " (\(result.alternateByteCount) bytes) under SubIFDs"
@@ -342,7 +414,11 @@ case "image":
         sigmaScale: sigmaScale,
         cfa: flag("--cfa") ?? "rggb",
         useGPU: hasFlag("--gpu"),
-        strength: flag("--strength").flatMap(Double.init) ?? 0.85,
+        strength: strength,
+        autoStrength: autoStrength,
+        taper: taper,
+        estimateNoise: estimateNoise,
+        checkerboardNoise: checkerboardNoise,
         budgetBytes: budgetBytes,
         forceColumns: forceColumns, forceRows: forceRows)
 
@@ -370,6 +446,11 @@ case "image":
             "clampedNegatives": result.clampedNegatives,
             "finalMin": Double(result.finalMin),
             "finalMax": Double(result.finalMax),
+            "estimateNoise": estimateNoise,
+            "noise": result.noiseModel.map { ["a": $0.a, "b": $0.b, "blocks": $0.blocks] } ?? NSNull(),
+            "autoStrength": autoStrength,
+            "strength": result.strength,
+            "sigma": result.sigma,
         ])
     } else {
         FileHandle.standardError.write(Data(String(
@@ -386,7 +467,22 @@ case "tile", "batch":
     // lifting-Haar profile fitting, times the per-channel demosaic-attenuation
     // medians (R 1.41, G 1.97, B 1.48). Without it the network sees sigma 3-4x
     // too small and under-denoises.
-    let sigmaScale = flag("--sigma-scale").map { parseDoubles($0) } ?? [2.82, 3.94, 2.96]
+    // `--look nlmf` sets the whole conditioning the way Photons' nonlocal denoiser runs it, so the
+    // two engines hand back results that can be compared: the frame's own measured curve, a weight
+    // derived from that curve, and the same per-pixel tapers. Explicit flags still win.
+    let look = flag("--look")
+    if let look, look != "nlmf" && look != "ansel" { die("--look wants nlmf or ansel, got \(look)") }
+    let nlmfLook = look == "nlmf"
+
+    let sigmaScale: [Double]
+    if let s = flag("--sigma-scale") {
+        sigmaScale = parseDoubles(s)
+    } else {
+        // A measured curve is already in the mosaic domain; the 2.82/3.94/2.96 calibration exists
+        // only to lift *profile* values (fitted on demosaiced pixels) into that domain, and applying
+        // it twice would condition the network on 3-4x the real noise.
+        sigmaScale = nlmfLook ? [1, 1, 1] : [2.82, 3.94, 2.96]
+    }
     guard sigmaScale.count == 3 else { die("--sigma-scale needs 3 values") }
     let a = parseDoubles(aStr).enumerated().map { $0.element * sigmaScale[$0.offset] * sigmaScale[$0.offset] }
     let b = parseDoubles(bStr).enumerated().map { $0.element * sigmaScale[$0.offset] * sigmaScale[$0.offset] }
@@ -469,12 +565,49 @@ case "tile", "batch":
         }
     }
 
+case "noise":
+    // The curve the denoiser would condition on, without denoising. Same decode, same
+    // normalization, same estimator as `image`, so the numbers cannot drift from what a run uses.
+    guard args.count >= 2 else { die("usage: noise <in.dng> [--cfa rggb] [--noise-sample checkerboard] [--json]") }
+    let probe = try NoiseProbe.measure(
+        input: URL(fileURLWithPath: args[1]),
+        cfaOverride: flag("--cfa"),
+        checkerboard: flag("--noise-sample").map { $0 == "checkerboard" } ?? false,
+        dumpMosaic: flag("--dump-mosaic").map { URL(fileURLWithPath: $0) })
+    let m = probe.model
+    let strength = AnselStrength.strength(shot: m.channelA, read: m.channelB)
+    if hasFlag("--json") {
+        emitJSON([
+            "width": probe.width, "height": probe.height,
+            "cfa": probe.fileCFA, "mosaicCfa": probe.mosaicCFA,
+            "a": m.a, "b": m.b, "blocks": m.blocks, "seconds": m.seconds,
+            "channelA": m.channelA, "channelB": m.channelB,
+            "sigma": m.referenceSigma,
+            "strength": strength,
+        ])
+    }
+    let lines = (0..<4).map { p in
+        String(format: "plane %d: a=%.3e b=%.3e  sigma(0.05)=%.5f  (%d blocks)",
+               p, m.a[p], m.b[p], m.sigma(AnselStrength.reference, plane: p), m.blocks[p])
+    }
+    let text = (["\(probe.width)×\(probe.height) \(probe.fileCFA) mosaic \(probe.mosaicCFA), "
+                 + String(format: "measured in %.1f s", m.seconds)] + lines
+                + [String(format: "channels R/G/B: a=%.3e/%.3e/%.3e b=%.3e/%.3e/%.3e",
+                          m.channelA[0], m.channelA[1], m.channelA[2],
+                          m.channelB[0], m.channelB[1], m.channelB[2]),
+                   String(format: "green sigma(0.05)=%.5f -> strength %.2f",
+                          m.referenceSigma, strength)])
+        .joined(separator: "\n") + "\n"
+    FileHandle.standardError.write(Data(text.utf8))
+    exit(0)
+
 case "capabilities":
     // Protocol probe, mirroring hdrmerge-swift. The host calls this once per launch
     // so a mismatched bundled binary fails loudly instead of producing bad pixels.
     var info: [String: Any] = [
         "tool": ["name": "ansel-denoise-swift", "protocol": 2],
-        "features": ["image", "image-dng", "image-dng-dual-raw", "tile", "batch", "bench", "info", "gpu"],
+        "features": ["image", "image-dng", "image-dng-dual-raw", "noise", "estimate-noise",
+                     "look-nlmf", "tile", "batch", "bench", "info", "gpu"],
         "cfaPatterns": ["rggb", "bggr", "grbg", "gbrg"],
         "inputLayout": "float32-planar-mosaic",
         "outputLayout": "float32-planar-mosaic",

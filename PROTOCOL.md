@@ -17,7 +17,8 @@ call for experiments and benchmarks.
 ```
 $ ansel-denoise-swift capabilities
 {"tool":{"name":"ansel-denoise-swift","protocol":2},
- "features":["image","image-dng","tile","batch","bench","info","gpu"],
+ "features":["image","image-dng","image-dng-dual-raw","noise","estimate-noise","look-nlmf",
+             "tile","batch","bench","info","gpu"],
  "cfaPatterns":["rggb","bggr","grbg","gbrg"],
  "gpu":"Apple M1 Max",
  "inputLayout":"float32-planar-mosaic","outputLayout":"float32-planar-mosaic",
@@ -50,8 +51,14 @@ metadata is the source's. Nothing about the picture's geometry is the host's bus
 |---|---|
 | `--out` | Output DNG. **Required**, and must also end in `.dng`. |
 | `--a`, `--b` | Per-channel Poisson-Gaussian coefficients, `Var = a·x + b` on [0,1]. Optional here — omitted, the tool uses `0.0004,0.0003,0.0004` / `3e-6,1e-6,1e-6`, the same defaults the host used to send. |
-| `--sigma-scale` | Per-channel sigma calibration. Default `2.82,3.94,2.96`. |
-| `--strength` | Blend toward the input: `out = in + s·(denoised − in)`. Default 0.85. |
+| `--sigma-scale` | Per-channel sigma calibration. Default `2.82,3.94,2.96`; `1,1,1` when the curve is measured (a measured curve is already in the mosaic domain). |
+| `--strength` | Blend toward the input: `out = in + s·(denoised − in)`. Default 0.85, or `auto` to derive it from the noise curve. |
+| `--estimate-noise` | Measure the Poisson-Gaussian curve from the file. Costs a few seconds; replaces `--a/--b`. |
+| `--noise-sample checkerboard` | Half the blocks during estimation (every brightness level still represented). |
+| `--taper q` / `--taper-knee lo,hi` | Give up `q` of the blend weight towards the highlights (`0`, the default, keeps it). Knees default `0.05,0.25`. |
+| `--shadow-taper q` / `--shadow-knee lo,hi` | The mirror at the floor; knees default `0.002,0.02`. |
+| `--look nlmf` | The conditioning Photons' nonlocal denoiser uses, so the two engines can be compared: `--estimate-noise`, `--sigma-scale 1,1,1`, `--strength auto`, `--taper 0.18 --taper-knee 0.05,0.25`, `--shadow-taper 0.50 --shadow-knee 0.002,0.02`. Explicit flags still win. |
+| `--dump-field PREFIX` | Debug door: `PREFIX.i.f32` (normalized input), `PREFIX.d.f32` (final field), `PREFIX.json` (curve, weight, taper). |
 | `--budget-gb` | Memory ceiling override. Omit to derive it from installed RAM (2/3, or 50 % below 12 GB). |
 | `--split CxR` | Force a cut pattern. For measuring seams. |
 | `--gpu` | Use Metal. Without it, CPU (roughly 30× slower). |
@@ -75,6 +82,10 @@ Response:
  "outputBytes":66788000,"tiles":950,
  "clampedNegatives":29486,"clampedOverOne":0,"finalMin":0,"finalMax":1,
  "sourceBelowBlack":29544,
+ "estimateNoise":true,"autoStrength":true,"strength":0.82,"sigma":0.00626,
+ "noise":{"a":[6.7e-4,6.9e-4,6.5e-4],"b":[4.3e-6,5.0e-6,4.1e-6],"blocks":[14652,14652,14652]},
+ "taper":{"highlight":0.18,"highlightLow":0.05,"highlightHigh":0.25,
+          "shadow":0.5,"shadowLow":0.002,"shadowHigh":0.02},
  "inputLayout":"dng-cfa","outputLayout":"dng-cfa"}
 ```
 
@@ -91,7 +102,31 @@ The fields a host needs to decide anything:
 | `finalMin` | Minimum of the array handed to the writer. **Always ≥ 0**; a negative here would become a sample below the black level. |
 | `sourceBelowBlack` | How many source samples were already below the black level. Tells "the clamp had nothing to do" apart from "the clamp ate signal". |
 | `outputBytes` / `tiles` | The DNG that was written. |
+| `estimateNoise` / `noise` | Whether the curve was measured, and its three-channel `a`/`b`. `noise` is `null` when the caller supplied the model. |
+| `autoStrength` / `strength` | Whether the weight was derived from the curve, and the value actually used. |
+| `sigma` | Green-plane sigma at 5 % brightness that `autoStrength` keyed on. |
+| `taper` | The per-pixel weight reduction that was applied; all zeros/high knees mean the historical frame-wide blend. |
 | `hasAlternate` / `alternate` | `--dual-raw` only. `hasAlternate: true` and `alternate: "denoised"` mean the file carries a second full-res raw; `alternateBytes` / `alternateTiles` size it. Without the flag they read `false` / `null` / `0`. |
+
+### Measure the curve — `noise`
+
+```
+ansel-denoise-swift noise shot.dng [--cfa rggb] [--noise-sample checkerboard] [--json]
+```
+
+Same decode, normalization and estimator as `image`, but no inference: the response is the curve a
+run would condition on, the green sigma at 5 % brightness, and the weight `auto` would pick.
+
+```json
+{"width":9536,"height":6344,"cfa":"rggb","mosaicCfa":"rggb",
+ "a":[6.7e-4,6.9e-4,6.5e-4,6.8e-4],"b":[4.3e-6,5.0e-6,4.1e-6,4.9e-6],
+ "blocks":[14652,14652,14652,14652],"seconds":6.1,
+ "channelA":[6.7e-4,6.7e-4,6.5e-4],"channelB":[4.3e-6,5.0e-6,4.1e-6],
+ "sigma":0.00626,"strength":0.82}
+```
+
+`a`/`b` are in R, G(red row), B, G(blue row) plane order; `channelA`/`channelB` collapse the four
+planes onto the network's three channels by pooling the two green fits.
 
 ### `--dual-raw`: two raws in one DNG
 

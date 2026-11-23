@@ -38,7 +38,23 @@ public struct DenoiseImageRequest: Sendable {
     public var cfa: String
     public var useGPU: Bool
     /// Blend of the result against the input: `out = in + strength·(denoised − in)`, in [0,1].
+    /// Ignored when `autoStrength` is set.
     public var strength: Double
+    /// Derive the blend weight from the resolved noise curve (`AnselStrength`) instead of taking
+    /// `strength`. One constant cannot suit ISO 800 and ISO 3200.
+    public var autoStrength: Bool
+    /// Per-pixel reduction of the blend towards the highlights and the floor. `identity` keeps the
+    /// historical frame-wide weight, bit for bit.
+    public var taper: BlendTaper
+    /// Measure the noise curve from this image instead of trusting `a`/`b`.
+    ///
+    /// With this on, `a` and `b` are replaced by the measured curve, and the sigma calibration that
+    /// converts a *profile* value (which is fitted on demosaiced pixels) into the mosaic domain must
+    /// not be applied on top — the measurement is already in the mosaic domain. That is why
+    /// `--look nlmf` sets `--sigma-scale 1,1,1`.
+    public var estimateNoise: Bool
+    /// Sample half the blocks on a checkerboard when estimating.
+    public var checkerboardNoise: Bool
     /// Override for the memory ceiling, in bytes. `nil` derives it from installed RAM.
     public var budgetBytes: Int?
     /// Skip planning and use exactly this many columns × rows. `nil` picks the minimum that fits.
@@ -48,6 +64,8 @@ public struct DenoiseImageRequest: Sendable {
     public init(input: URL, output: URL, width: Int, height: Int,
                 a: [Double], b: [Double], sigmaScale: [Double] = [2.82, 3.94, 2.96],
                 cfa: String = "rggb", useGPU: Bool = true, strength: Double = 0.85,
+                autoStrength: Bool = false, taper: BlendTaper = .identity,
+                estimateNoise: Bool = false, checkerboardNoise: Bool = false,
                 budgetBytes: Int? = nil, forceColumns: Int? = nil, forceRows: Int? = nil) {
         self.input = input
         self.output = output
@@ -59,6 +77,10 @@ public struct DenoiseImageRequest: Sendable {
         self.cfa = cfa
         self.useGPU = useGPU
         self.strength = strength
+        self.autoStrength = autoStrength
+        self.taper = taper
+        self.estimateNoise = estimateNoise
+        self.checkerboardNoise = checkerboardNoise
         self.budgetBytes = budgetBytes
         self.forceColumns = forceColumns
         self.forceRows = forceRows
@@ -84,6 +106,14 @@ public struct DenoiseImageResult: Sendable {
     /// quantize. Holding it here instead of re-reading the output file avoids a third pass over
     /// the image.
     public let mosaic: [Float]
+    /// The measured curve, when `estimateNoise` asked for one. Also what drove the conditioning.
+    public let noiseModel: NoiseEstimateModel?
+    /// Blend weight actually applied before the tapers.
+    public let strength: Double
+    /// Green-plane sigma at 5 % brightness that `autoStrength` keyed on.
+    public let sigma: Double
+    /// Per-pixel reduction applied to `strength`.
+    public let taper: BlendTaper
 }
 
 public enum DenoiseImageError: Error, CustomStringConvertible {
@@ -141,6 +171,47 @@ public enum DenoiseImageRunner {
         guard W > 0, H > 0 else { throw DenoiseImageError.badInput("empty image") }
         guard mosaic.count == W * H else {
             throw DenoiseImageError.badInput("mosaic holds \(mosaic.count) samples, expected \(W * H) for \(W)×\(H)")
+        }
+
+        // The noise model, before any tiling: measure it from this image, or take the caller's.
+        //
+        // Measuring here rather than in the host is the whole point of the DNG path — the tool has
+        // the mosaic the network will see, in the domain the network sees it in. A profile fitted on
+        // demosaiced pixels is a different quantity (2x from the profiling filter, plus demosaic
+        // attenuation), which is why the calibration is applied only on the profile path.
+        var a = request.a
+        var b = request.b
+        var noiseModel: NoiseEstimateModel?
+        if request.estimateNoise {
+            let model = try AnselNoiseEstimator.measure(mosaic, width: W, height: H,
+                                                       cfa: request.cfa,
+                                                       checkerboard: request.checkerboardNoise)
+            noiseModel = model
+            a = model.channelA
+            b = model.channelB
+            progress?(String(format: "noise measured in %.1f s", model.seconds))
+            for p in 0..<4 where model.blocks[p] > 0 {
+                progress?(String(format: "  plane %d: a=%.3e b=%.3e  sigma(0.05)=%.5f  (%d blocks)",
+                                 p, model.a[p], model.b[p],
+                                 model.sigma(AnselStrength.reference, plane: p), model.blocks[p]))
+            }
+        }
+        let variance = a[1] * AnselStrength.reference + b[1]
+        let sigma = variance > 0 ? variance.squareRoot() : 0
+        let strength = request.autoStrength ? AnselStrength.strength(forSigma: sigma) : request.strength
+        let sBase = Float(min(max(strength, 0), 1))
+        progress?(String(format: "strength %.2f (sigma(0.05)=%.5f%@)", strength, sigma,
+                         request.autoStrength ? ", derived from the noise model" : ""))
+        if request.taper.highlight > 0 {
+            progress?(String(format: "  blend %.2f -> %.2f over raw %.2f-%.2f (q=%.2f)",
+                             strength, strength * (1 - request.taper.highlight),
+                             request.taper.highlightLow, request.taper.highlightHigh,
+                             request.taper.highlight))
+        }
+        if request.taper.shadow > 0 {
+            progress?(String(format: "  blend %.2f at the floor, full again at raw %.3f (q=%.2f)",
+                             strength * (1 - request.taper.shadow),
+                             request.taper.shadowHigh, request.taper.shadow))
         }
 
         let budget = request.budgetBytes ?? DenoisePlanner.memoryLimit()
@@ -216,13 +287,13 @@ public enum DenoiseImageRunner {
                 var resized: [Float]
                 if let gpu {
                     resized = try gpu.denoise(mosaic: input, width: rw, height: rh,
-                                              cfa: request.cfa, a: request.a, b: request.b)
+                                              cfa: request.cfa, a: a, b: b)
                 } else {
                     let color = AnselDenoiseForward.colorIndexMap(
                         pattern: request.cfa, width: rw, height: rh)
                     let planes = AnselDenoiseForward.makeInputPlanes(
                         mosaic: input, colorIndex: color, width: rw, height: rh,
-                        a: request.a, b: request.b)
+                        a: a, b: b)
                     let den = try cpu!.denoise(planes)
                     resized = Array(den.data[0..<(rw * rh)])
                 }
@@ -261,9 +332,14 @@ public enum DenoiseImageRunner {
         // [0,1]: samples below the black level normalize negative, and a DNG reader will hand those
         // over as they are. So the blend can pull values back out of range, and the clamp has to
         // run again afterwards — once, on the array that actually leaves here.
-        let s = Float(min(max(request.strength, 0), 1))
-        if s < 1 {
+        //
+        // The weight is `strength` reduced per pixel by the taper (`BlendTaper`): shadows keep the
+        // whole weight, highlights give up a fraction, and the floor holds back the most. With
+        // `taper == .identity` the factor is exactly 1 everywhere, so this reduces to the
+        // historical `in + s·(d − in)` bit for bit.
+        if sBase < 1 || request.taper != .identity {
             for i in 0..<W * H where wsum[i] > 0 {
+                let s = sBase * request.taper.factor(for: mosaic[i])
                 result[i] = mosaic[i] + s * (result[i] - mosaic[i])
             }
         }
@@ -290,7 +366,11 @@ public enum DenoiseImageRunner {
                                   clampedOverOne: overs,
                                   finalMin: lo,
                                   finalMax: hi,
-                                  mosaic: result)
+                                  mosaic: result,
+                                  noiseModel: noiseModel,
+                                  strength: strength,
+                                  sigma: sigma,
+                                  taper: request.taper)
     }
 
     /// Drop the padding added on the right and bottom before the forward pass.
