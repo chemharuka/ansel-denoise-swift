@@ -54,6 +54,10 @@ public struct DenoiseImageRequest: Sendable {
     public var detailKneeHigh: Double
     /// Fine-band Gaussian sigma, in plane pixels.
     public var detailSigma: Double
+    /// Diagnostics: write the per-sample gate weight to `<prefix>.f32` plus a
+    /// `<prefix>.txt` sidecar holding `width height`. The field is the mosaic the
+    /// blend ran on, row-major, float32. `nil` writes nothing.
+    public var dumpGatePrefix: String?
     /// Measure the noise curve from this image instead of trusting `a`/`b`.
     ///
     /// With this on, `a` and `b` are replaced by the measured curve, and the sigma calibration that
@@ -83,7 +87,8 @@ public struct DenoiseImageRequest: Sendable {
                 detailGate: Double = DetailGateOptions.standard.maxWeight,
                 detailKnee: (low: Double, high: Double) =
                     (DetailGateOptions.standard.kneeLow, DetailGateOptions.standard.kneeHigh),
-                detailSigma: Double = DetailGateOptions.standard.sigma) {
+                detailSigma: Double = DetailGateOptions.standard.sigma,
+                dumpGatePrefix: String? = nil) {
         self.input = input
         self.output = output
         self.width = width
@@ -100,6 +105,7 @@ public struct DenoiseImageRequest: Sendable {
         self.detailKneeLow = detailKnee.low
         self.detailKneeHigh = detailKnee.high
         self.detailSigma = detailSigma
+        self.dumpGatePrefix = dumpGatePrefix
         self.estimateNoise = estimateNoise
         self.checkerboardNoise = checkerboardNoise
         self.budgetBytes = budgetBytes
@@ -148,11 +154,13 @@ public struct DenoiseImageResult: Sendable {
 public enum DenoiseImageError: Error, CustomStringConvertible {
     case badInput(String)
     case pieceFailed(Int, String)
+    case write(String)
 
     public var description: String {
         switch self {
         case .badInput(let m):       return "bad input: \(m)"
         case .pieceFailed(let i, let m): return "piece \(i) failed: \(m)"
+        case .write(let m):          return "write: \(m)"
         }
     }
 }
@@ -371,6 +379,7 @@ public enum DenoiseImageRunner {
         // band of the residual, and only where the *input* — not the residual — is coherent.
         // `detailGate == 0` skips the whole thing and runs the historical loop below.
         var detailMeanWeight = 0.0
+        var gateWeights: [Float]?
         if request.detailGate > 0 && sBase > 0 {
             // `acc` is dead once `result` is built; `wsum` is dead too, so reuse it for the
             // per-sample sigma lookup rather than allocating another 60 MP array.
@@ -378,13 +387,15 @@ public enum DenoiseImageRunner {
             DetailGate.fillSigma(&wsum, input: mosaic, width: W, height: H,
                                  a: a, b: b, cfa: request.cfa)
             let gateStart = Date()
-            detailMeanWeight = DetailGate.applyMosaic(
+            let run = DetailGate.applyMosaicDetailed(
                 input: mosaic, output: &result, width: W, height: H,
                 sigma: wsum, cfa: request.cfa, strength: sBase, taper: request.taper,
                 options: DetailGateOptions(maxWeight: request.detailGate,
                                            kneeLow: request.detailKneeLow,
                                            kneeHigh: request.detailKneeHigh,
                                            sigma: request.detailSigma))
+            detailMeanWeight = run.meanWeight
+            if request.dumpGatePrefix != nil { gateWeights = run.weights }
             progress?(String(format: "detail gate %.2f, mean weight %.3f, %.2f s",
                              request.detailGate, detailMeanWeight,
                              Date().timeIntervalSince(gateStart)))
@@ -393,6 +404,10 @@ public enum DenoiseImageRunner {
                 let s = sBase * request.taper.factor(for: mosaic[i])
                 result[i] = mosaic[i] + s * (result[i] - mosaic[i])
             }
+        }
+        if let prefix = request.dumpGatePrefix {
+            let weights = gateWeights ?? [Float](repeating: 0, count: W * H)
+            try writeGateWeights(prefix: prefix, weights: weights, width: W, height: H)
         }
 
         var negatives = 0, overs = 0
@@ -427,6 +442,20 @@ public enum DenoiseImageRunner {
                                   detailKneeLow: request.detailKneeLow,
                                   detailKneeHigh: request.detailKneeHigh,
                                   detailBoxPlanePixels: DetailGate.boxPlanePixels)
+    }
+
+    /// `--dump-gate`: the weight field as float32 plus a `width height` sidecar. The
+    /// sidecar is what keeps the dump readable without asking the DNG again.
+    static func writeGateWeights(prefix: String, weights: [Float],
+                                 width: Int, height: Int) throws {
+        do {
+            try weights.withUnsafeBufferPointer { Data(buffer: $0) }
+                .write(to: URL(fileURLWithPath: prefix + ".f32"))
+            try Data("\(width) \(height)\n".utf8)
+                .write(to: URL(fileURLWithPath: prefix + ".txt"))
+        } catch {
+            throw DenoiseImageError.write("dump gate: \(error)")
+        }
     }
 
     /// Drop the padding added on the right and bottom before the forward pass.

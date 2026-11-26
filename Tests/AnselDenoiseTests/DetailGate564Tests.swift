@@ -4,6 +4,10 @@ import XCTest
 /// 564 — the coherence gate. The synthetic cases are deterministic: a canvas-like
 /// 3.4 px sine in one window next to a pure-noise window, with the denoised field
 /// modelled as "the old blend kept 40 % of the fine band".
+///
+/// The field is wide enough (1280 px) that the §9 weight smoothing — 128 samples
+/// half-width, two passes (a 257-sample window) — stays local relative to the two
+/// windows. The same 257-sample window runs on the real mosaic.
 final class DetailGate564Tests: XCTestCase {
 
     // MARK: - deterministic noise
@@ -23,9 +27,15 @@ final class DetailGate564Tests: XCTestCase {
         }
     }
 
-    static let width = 256
-    static let height = 128
+    static let width = 1280
+    static let height = 320
     static let noiseSigma: Float = 0.004
+
+    // Texture lives on the left, noise on the right; both sample windows stay more
+    // than one smoothing window away from the boundary at x = 384.
+    static let textureX = 48..<288
+    static let noiseX = 928..<1216
+    static let sampleY = 96..<224
 
     /// Left half: 3.4 px sine + noise. Right half: noise only. `d` keeps 40 % of
     /// the sine's fine band, so the old blend is a plausible under-detailed result.
@@ -43,10 +53,10 @@ final class DetailGate564Tests: XCTestCase {
                 // region has an edge too; this keeps the synthetic from turning
                 // that edge into a one-sample impulse that no window can smooth.
                 let fade: Float
-                if x < w / 2 - 64 {
+                if x < 320 {
                     fade = 1
-                } else if x < w / 2 {
-                    let t = Float(w / 2 - x) / 64
+                } else if x < 384 {
+                    let t = Float(384 - x) / 64
                     fade = t * t * (3 - 2 * t)
                 } else {
                     fade = 0
@@ -88,6 +98,19 @@ final class DetailGate564Tests: XCTestCase {
         return (sum / Double(count)).squareRoot()
     }
 
+    static func meanWeight(_ weights: [Float], width: Int,
+                           x: Range<Int>, y: Range<Int>) -> Double {
+        var sum = 0.0
+        var count = 0
+        for yy in y {
+            for xx in x {
+                sum += Double(weights[yy * width + xx])
+                count += 1
+            }
+        }
+        return sum / Double(count)
+    }
+
     // MARK: - (a) texture retained, noise untouched
 
     func testFineTextureIsRetainedAndPureNoiseIsNot() {
@@ -97,21 +120,45 @@ final class DetailGate564Tests: XCTestCase {
         let mean = DetailGate.apply(input: c.input, output: &output, width: w, height: h,
                                     sigma: c.sigma, strength: 1,
                                     options: .standard, pixelScale: 1)
-        XCTAssertGreaterThan(mean, 0.05)
+
+        // `wMax` is 0.35 by design (§9: keep the correction under the visibility
+        // threshold), so the first cut's "≥ 85 % of the input in the fine band"
+        // is unreachable here: with this model the most any weight can return is
+        // `1 − 0.6·(1 − 0.35) = 61 %`, and the measured frame's own R4 weave line
+        // is 0.050σ against 0.071σ input (71 %). The assertions below are the
+        // calibration that *does* apply: clearly more than the old blend, and the
+        // noise half untouched. The 0.5 mean-weight bound from R1 is likewise out
+        // of range: no pixel can exceed 0.35 now.
+        XCTAssertGreaterThan(mean, 0.02)
+        XCTAssertLessThanOrEqual(mean, DetailGateOptions.standard.maxWeight + 1e-6)
 
         let inputTexture = Self.highpassRMS(c.input, width: w, height: h,
-                                            x0: 8, x1: 56, y0: 32, y1: 96)
+                                            x0: Self.textureX.lowerBound,
+                                            x1: Self.textureX.upperBound,
+                                            y0: Self.sampleY.lowerBound,
+                                            y1: Self.sampleY.upperBound)
         let outputTexture = Self.highpassRMS(output, width: w, height: h,
-                                             x0: 8, x1: 56, y0: 32, y1: 96)
-        XCTAssertGreaterThanOrEqual(outputTexture / inputTexture, 0.85,
-                                    "fine sine kept \(outputTexture / inputTexture * 100)%")
+                                             x0: Self.textureX.lowerBound,
+                                             x1: Self.textureX.upperBound,
+                                             y0: Self.sampleY.lowerBound,
+                                             y1: Self.sampleY.upperBound)
+        let legacyTexture = Self.highpassRMS(c.denoised, width: w, height: h,
+                                             x0: Self.textureX.lowerBound,
+                                             x1: Self.textureX.upperBound,
+                                             y0: Self.sampleY.lowerBound,
+                                             y1: Self.sampleY.upperBound)
+        let kept = outputTexture / inputTexture
+        XCTAssertGreaterThanOrEqual(kept, 0.5,
+                                    "fine sine kept \(kept * 100)% of the input")
+        XCTAssertGreaterThanOrEqual(outputTexture / legacyTexture, 1.35,
+                                    "the gate must return clearly more than the old blend")
 
         // The pure-noise half must stay on the old blend. A few pixels may cross
         // the low knee by chance; the mean difference has to remain sub-DN.
         var diff = 0.0
         var count = 0
-        for y in 32..<96 {
-            for x in 160..<224 {
+        for y in Self.sampleY {
+            for x in Self.noiseX {
                 let i = y * w + x
                 diff += abs(Double(output[i] - c.denoised[i]))
                 count += 1
@@ -119,6 +166,13 @@ final class DetailGate564Tests: XCTestCase {
         }
         XCTAssertLessThanOrEqual(diff / Double(count) * 65535, 1.0,
                                  "pure-noise mean error must be at most one DN")
+
+        let textureMean = Self.meanWeight(
+            DetailGate.weights(input: c.input, width: w, height: h,
+                               sigma: c.sigma, options: .standard, pixelScale: 1),
+            width: w, x: Self.textureX, y: Self.sampleY)
+        XCTAssertGreaterThan(textureMean, 0.15,
+                             "texture must open the gate; measured mean \(textureMean)")
     }
 
     func testPureNoiseMeanWeightIsSmall() {
@@ -126,14 +180,38 @@ final class DetailGate564Tests: XCTestCase {
         let w = Self.width, h = Self.height
         let weights = DetailGate.weights(input: c.input, width: w, height: h,
                                          sigma: c.sigma, options: .standard, pixelScale: 1)
-        var sum = 0.0, count = 0
-        for y in 32..<96 {
-            for x in 160..<224 {
-                sum += Double(weights[y * w + x])
-                count += 1
-            }
-        }
-        XCTAssertLessThanOrEqual(sum / Double(count), 0.05)
+        let mean = Self.meanWeight(weights, width: w, x: Self.noiseX, y: Self.sampleY)
+        XCTAssertLessThanOrEqual(mean, 0.05)
+    }
+
+    /// The gate's envelope used to be divided by `sigma(x)`, so an all-zero sigma
+    /// (a caller that has no curve) closed it. It is now self-normalised; zero
+    /// sigma must still return the same weights and the same fine band.
+    func testZeroSigmaKeepsTheFineBand() {
+        let c = Self.makeCase()
+        let w = Self.width, h = Self.height
+        let zero = [Float](repeating: 0, count: w * h)
+        let baseline = DetailGate.weights(input: c.input, width: w, height: h,
+                                          sigma: c.sigma, options: .standard, pixelScale: 1)
+        let withZero = DetailGate.weights(input: c.input, width: w, height: h,
+                                          sigma: zero, options: .standard, pixelScale: 1)
+        XCTAssertTrue(baseline == withZero,
+                      "the gate must not depend on the noise model")
+
+        let inputTexture = Self.highpassRMS(c.input, width: w, height: h,
+                                            x0: Self.textureX.lowerBound,
+                                            x1: Self.textureX.upperBound,
+                                            y0: Self.sampleY.lowerBound,
+                                            y1: Self.sampleY.upperBound)
+        var output = c.denoised
+        DetailGate.apply(input: c.input, output: &output, width: w, height: h,
+                         sigma: zero, strength: 1, options: .standard, pixelScale: 1)
+        let outputTexture = Self.highpassRMS(output, width: w, height: h,
+                                             x0: Self.textureX.lowerBound,
+                                             x1: Self.textureX.upperBound,
+                                             y0: Self.sampleY.lowerBound,
+                                             y1: Self.sampleY.upperBound)
+        XCTAssertGreaterThanOrEqual(outputTexture / inputTexture, 0.5)
     }
 
     // MARK: - (c) continuity
@@ -146,8 +224,8 @@ final class DetailGate564Tests: XCTestCase {
                                          sigma: c.sigma, options: .standard, pixelScale: 1)
         var maxStep: Float = 0
         var whereStep = (x: 0, y: 0)
-        for y in 32..<96 {
-            for x in 32..<224 {
+        for y in 32..<(h - 32) {
+            for x in 32..<(w - 32) {
                 let i = y * w + x
                 let sx = abs(weights[i + 1] - weights[i])
                 let sy = abs(weights[i + w] - weights[i])
@@ -185,12 +263,21 @@ final class DetailGate564Tests: XCTestCase {
                                     options: .off, pixelScale: 1)
         XCTAssertEqual(mean, 0)
         XCTAssertEqual(gated, reference, "detailGate = 0 must be the historical loop")
+
+        var mosaicGated = denoised
+        let mosaicMean = DetailGate.applyMosaic(input: input, output: &mosaicGated,
+                                                width: 99, height: 77, sigma: sigma,
+                                                cfa: "rggb", strength: 0.83, taper: .nlmf,
+                                                options: .off)
+        XCTAssertEqual(mosaicMean, 0)
+        XCTAssertEqual(mosaicGated, reference,
+                       "detailGate = 0 on the mosaic path must be the historical loop")
     }
 
     /// A flat wall with different R/G/B levels must not look like texture. Measuring
     /// coherence on the raw mosaic would see the 2×2 colour pattern and gate it.
     func testMosaicColourPatternIsNotCoherence() {
-        let w = 128, h = 128
+        let w = 512, h = 256
         let n = w * h
         var rng = RNG()
         var input = [Float](repeating: 0, count: n)
@@ -209,8 +296,11 @@ final class DetailGate564Tests: XCTestCase {
                                           width: w, height: h, sigma: sigma,
                                           cfa: "rggb", strength: 1,
                                           options: .standard)
-        XCTAssertLessThanOrEqual(mean, 0.05)
-        XCTAssertEqual(output, input, "a flat colour field must keep the old blend exactly")
+        XCTAssertLessThanOrEqual(mean, 0.02)
+        // With `output == input` the residual is zero, so this is the old blend; the
+        // point of the test is the mean above: the 2×2 colour pattern must not open
+        // the gate on a flat field.
+        XCTAssertEqual(output, input)
     }
 
     // MARK: - the gate does not read the noise model
@@ -251,9 +341,9 @@ final class DetailGate564Tests: XCTestCase {
     // MARK: - the envelope zero point is calibrated, not assumed
 
     /// The frame floor is a p15 of the very envelope it divides, so a flat field
-    /// would sit at `p50/p15` — about 1.02 for the 33 px window — and a knee at 1.05
-    /// would open on a blank wall. `c0` is measured on a synthetic unit-noise field
-    /// through this operator and must be deterministic across calls.
+    /// would sit at `p50/p15` — about 1.02 for the 33 px window — and a knee at
+    /// 1.00 would open on a blank wall. `c0` is measured on a synthetic unit-noise
+    /// field through this operator and must be deterministic across calls.
     func testEnvelopeZeroPointIsMeasuredAndCached() {
         let c0 = DetailGate.envelopeZeroPoint(sigmaPixels: 1.5, boxHalf: 16)
         print("564 envelope zero point c0 = \(c0)")
@@ -261,6 +351,30 @@ final class DetailGate564Tests: XCTestCase {
         XCTAssertLessThan(c0, 1.20)
         XCTAssertEqual(c0, DetailGate.envelopeZeroPoint(sigmaPixels: 1.5, boxHalf: 16),
                        "the calibration is a property of the operator and must not drift")
+    }
+
+    // MARK: - the diagnostics dump
+
+    /// `--dump-gate`: float32, mosaic size, row-major, plus a `width height` sidecar.
+    func testGateDumpWritesFloatFieldAndSidecar() throws {
+        let w = 64, h = 32
+        let weights = (0..<(w * h)).map { Float($0) / Float(w * h) }
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("detail-gate-564-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let prefix = dir.appendingPathComponent("gate").path
+        try DenoiseImageRunner.writeGateWeights(prefix: prefix, weights: weights,
+                                                width: w, height: h)
+
+        let raw = try Data(contentsOf: URL(fileURLWithPath: prefix + ".f32"))
+        XCTAssertEqual(raw.count, w * h * MemoryLayout<Float>.size)
+        let read = raw.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+        XCTAssertEqual(read, weights)
+
+        let sidecar = try String(contentsOfFile: prefix + ".txt", encoding: .utf8)
+        let parts = sidecar.split(whereSeparator: { $0 == " " || $0 == "\n" })
+        XCTAssertEqual(parts.map(String.init), ["64", "32"])
     }
 
     // MARK: - filter primitives

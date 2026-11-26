@@ -79,6 +79,9 @@ public struct DenoiseDNGRequest {
     /// the decoder's own noise reduction, so "the shadows lost detail" can mean three things there.
     /// Comparing two runs in this domain answers the question the render cannot.
     public var dumpFieldPrefix: String?
+    /// Diagnostics: `--dump-gate PREFIX` writes the gate weight field as
+    /// `PREFIX.f32` (mosaic size, row-major, float32) plus `PREFIX.txt` (`width height`).
+    public var dumpGatePrefix: String?
 
     public var detailKnee: (low: Double, high: Double) {
         get { (detailKneeLow, detailKneeHigh) }
@@ -101,6 +104,7 @@ public struct DenoiseDNGRequest {
                 writerGrid: DNGRawWriter.TileGrid = DNGRawWriter.TileGrid(),
                 dualRaw: Bool = false,
                 dumpFieldPrefix: String? = nil,
+                dumpGatePrefix: String? = nil,
                 detailGate: Double = DetailGateOptions.standard.maxWeight,
                 detailKnee: (low: Double, high: Double) =
                     (DetailGateOptions.standard.kneeLow, DetailGateOptions.standard.kneeHigh),
@@ -130,6 +134,7 @@ public struct DenoiseDNGRequest {
         self.writerGrid = writerGrid
         self.dualRaw = dualRaw
         self.dumpFieldPrefix = dumpFieldPrefix
+        self.dumpGatePrefix = dumpGatePrefix
     }
 }
 
@@ -319,7 +324,8 @@ public enum DenoiseDNGPipeline {
             forceColumns: request.forceColumns, forceRows: request.forceRows,
             detailGate: request.detailGate,
             detailKnee: request.detailKnee,
-            detailSigma: request.detailSigma)
+            detailSigma: request.detailSigma,
+            dumpGatePrefix: request.dumpGatePrefix)
 
         let inferenceStart = Date()
         let denoised = try DenoiseImageRunner.denoiseMosaic(mosaic, width: width, height: height,

@@ -163,12 +163,13 @@ public struct AnselDenoiseOptions: Sendable, Equatable {
     /// 本帧测得的 σ 自己定力度（0.70–0.85），所以 app 的默认路径不再发 `--strength 0.50`。
     public var strength: Double = 0.50
 
-    /// 564 — coherence-gated fine-band blend. Defaults are the engine's measured look;
-    /// `detailGate == 0` is the historical blend. Kept on the host side so an experiment
-    /// can turn the gate down without rebuilding the tool.
-    public var detailGate: Double = 0.85
-    public var detailKneeLow: Double = 1.05
-    public var detailKneeHigh: Double = 1.25
+    /// 564 — coherence-gated fine-band blend. Defaults are the engine's §9 measured look
+    /// (a deliberately small correction: `detailGate` is only 0.35, so the gate can never
+    /// read as a patch); `detailGate == 0` is the historical blend. Kept on the host side
+    /// so an experiment can turn the gate down without rebuilding the tool.
+    public var detailGate: Double = 0.35
+    public var detailKneeLow: Double = 1.00
+    public var detailKneeHigh: Double = 1.40
     public var detailSigma: Double = 1.5
 
     public init() {}
@@ -177,10 +178,10 @@ public struct AnselDenoiseOptions: Sendable, Equatable {
     /// binary (which rejects unknown flags) keeps working on the default path.
     var detailArguments: [String] {
         var out: [String] = []
-        if detailGate != 0.85 {
+        if detailGate != 0.35 {
             out += ["--detail-gate", String(format: "%.9g", detailGate)]
         }
-        if detailKneeLow != 1.05 || detailKneeHigh != 1.25 {
+        if detailKneeLow != 1.00 || detailKneeHigh != 1.40 {
             out += ["--detail-knee", String(format: "%.9g,%.9g", detailKneeLow, detailKneeHigh)]
         }
         if detailSigma != 1.5 {

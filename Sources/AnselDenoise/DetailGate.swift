@@ -19,7 +19,7 @@
 //      fi = i − G(σf)(i)              same band on the input
 //      env = sqrt(boxmean(fi², 33px)) squared fine-band envelope
 //      C  = env / (floor(bin(x)) · c0)  self-normalized grain floor
-//      w  = wMax·smoothstep(1.05, 1.25, C)
+//      w  = wMax·smoothstep(1.00, 1.40, C)
 //      out = i + s·(r − w·f)
 //
 //  The floor is the 15th percentile of `env` inside a brightness bin, measured on
@@ -34,7 +34,7 @@
 //  `c0` puts the zero point of `C` back at 1.0. The floor is a p15 of the *same*
 //  envelope distribution, so on a flat field `env/floor` has a median of
 //  `p50/p15`, not one; with the 33 px envelope window measured here that ratio is
-//  about 1.02. Left uncorrected, a knee at 1.05 opens on a blank wall. `c0` is the
+//  about 1.02. Left uncorrected, a knee at 1.00 opens on a blank wall. `c0` is the
 //  median-to-p15 ratio of a synthetic unit white-noise field run through the same
 //  fine band and box mean — a property of the filter, not of the frame or of the
 //  noise model — measured once per operator and cached.
@@ -60,9 +60,9 @@ public struct DetailGateOptions: Sendable, Equatable {
     /// Gaussian sigma of the fine band, in plane pixels.
     public var sigma: Double
 
-    public init(maxWeight: Double = 0.85,
-                kneeLow: Double = 1.05,
-                kneeHigh: Double = 1.25,
+    public init(maxWeight: Double = 0.35,
+                kneeLow: Double = 1.00,
+                kneeHigh: Double = 1.40,
                 sigma: Double = 1.5) {
         self.maxWeight = maxWeight
         self.kneeLow = kneeLow
@@ -82,15 +82,19 @@ public enum DetailGate {
     /// a half-width too; 16 is the measured value and this constant now says
     /// explicitly which half of the window it is.)
     public static let boxPlanePixels = 16.0
-    /// **Half** width of one weight-smoothing box, in plane pixels. The window is
-    /// `2·16 + 1 = 33` plane pixels, the same window as the envelope; three of them
-    /// are chained. The first choice was 12 (a 25 px window), but it measured a
-    /// 0.0239 neighbour step on the 564 synthetic — essentially the R2 failure it
-    /// was meant to fix. 16/33 brings that to 0.0186, below the 0.02 continuity
-    /// limit the test has always used, without touching the assertion.
-    public static let weightSmoothingPlanePixels = 16.0
+    /// **Half** width of one weight-smoothing box, in weight-grid samples. The gate
+    /// weight lives on the mosaic (one sample per photosite), and 564's measurements
+    /// were taken against that field, so the constant is used as-is on the mosaic:
+    /// 128 gives a 257-sample window. Tests that hand over a single plane use the
+    /// same 128 on the plane grid. Two passes are chained.
+    ///
+    /// 564 §9 settled on this after the 33-px window still made the gate patchy:
+    /// on L1040080 the standard deviation of 64-px block means was 0.313 with the
+    /// narrow window. The gate's own weight range is only `0.35` now, so a wide,
+    /// gentle field is what keeps the correction from reading as a patch.
+    public static let weightSmoothingPlanePixels = 128.0
     /// How many times the weight field is smoothed before it is applied.
-    public static let weightSmoothingPasses = 3
+    public static let weightSmoothingPasses = 2
     /// Brightness bins for the grain floor.
     public static let floorBins = 32
     /// Percentile of the envelope that becomes the grain floor inside a bin.
@@ -235,13 +239,31 @@ public enum DetailGate {
                                    strength: Float,
                                    taper: BlendTaper = .identity,
                                    options: DetailGateOptions = .standard) -> Double {
+        applyMosaicDetailed(input: input, output: &output, width: width, height: height,
+                            sigma: sigma, cfa: cfa, strength: strength, taper: taper,
+                            options: options).meanWeight
+    }
+
+    /// CFA-aware entry point that also hands back the per-sample gate weight, so a
+    /// diagnostics run can dump the field the blend actually used. The gate cost is
+    /// the same as `applyMosaic`; the weight array already exists either way.
+    @discardableResult
+    public static func applyMosaicDetailed(input: [Float],
+                                           output: inout [Float],
+                                           width: Int, height: Int,
+                                           sigma: [Float],
+                                           cfa: String,
+                                           strength: Float,
+                                           taper: BlendTaper = .identity,
+                                           options: DetailGateOptions = .standard)
+        -> (meanWeight: Double, weights: [Float]) {
         let n = width * height
         precondition(input.count == n && output.count == n && sigma.count == n)
 
         let maxWeight = Float(min(max(options.maxWeight, 0), 1))
         if maxWeight == 0 || strength == 0 || options.sigma <= 0 {
             legacyBlend(input: input, output: &output, strength: strength, taper: taper)
-            return 0
+            return (0, [Float](repeating: 0, count: n))
         }
 
         let sigmaMosaic = Float(options.sigma * planeToMosaic)
@@ -260,8 +282,9 @@ public enum DetailGate {
         let weights = weightField(coherence: coherence, options: options,
                                   maxWeight: maxWeight, pixelScale: 1,
                                   width: width, height: height)
-        return finish(input: input, output: &output, residual: residual, coarse: coarse,
-                      weights: weights, strength: strength, taper: taper)
+        let mean = finish(input: input, output: &output, residual: residual, coarse: coarse,
+                          weights: weights, strength: strength, taper: taper)
+        return (mean, weights)
     }
 
     private static func finish(input: [Float], output: inout [Float],
@@ -285,7 +308,7 @@ public enum DetailGate {
         return sumWeight / Double(input.count)
     }
 
-    /// Coherence -> weight, then three chained box passes over the finished field.
+    /// Coherence -> weight, then two chained box passes over the finished field.
     /// The smoothing is a box convolution of a smoothstep of a box mean, so it cannot
     /// introduce a boundary; it only widens the knee at a hard edge. No epsilon is
     /// applied: zeroing a statistical tail would make the field discontinuous again.
@@ -381,7 +404,7 @@ public enum DetailGate {
     /// `median(env) / p15(env)` on a synthetic unit white-noise field run through this
     /// exact fine band and box mean. The frame floor is itself a p15 of the envelope,
     /// so a flat patch would otherwise sit at `p50/p15` instead of 1; dividing by this
-    /// ratio is what makes a knee at 1.05 keep a blank wall closed.
+    /// ratio is what makes a knee at 1.00 keep a blank wall closed.
     ///
     /// Independent of the noise model by construction: the field is generated, not
     /// measured. Cached per `(sigmaPixels, boxHalf)`, so the cost is one filter pass

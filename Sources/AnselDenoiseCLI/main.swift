@@ -10,6 +10,7 @@
 //            [--cfa rggb] [--gpu] [--strength S|auto] [--estimate-noise] [--look nlmf]
 //            [--taper q] [--taper-knee lo,hi] [--shadow-taper q] [--shadow-knee lo,hi]
 //            [--detail-gate W] [--detail-knee lo,hi] [--detail-sigma S]
+//            [--dump-gate PREFIX]
 //            [--budget-gb G] [--dual-raw] [--dump-field PREFIX] [--split CxR]
 //            --out <out.dng|out.f32> [--json]
 //        Whole-image entry point: plans for memory, splits the few times it can,
@@ -289,6 +290,8 @@ case "image":
         guard let v = Double(s) else { die("--detail-sigma wants a number, got \(s)") }
         detailSigma = v
     }
+    // Diagnostics door: the per-sample gate weight as float32 + `width height`.
+    let dumpGatePrefix = flag("--dump-gate")
 
     let model = try AnselDenoiseModel(contentsOf: URL(fileURLWithPath: args[1]))
     var engine: MetalConv?
@@ -330,6 +333,7 @@ case "image":
             expectedHeight: flag("--height").flatMap(Int.init),
             dualRaw: hasFlag("--dual-raw"),
             dumpFieldPrefix: flag("--dump-field"),
+            dumpGatePrefix: dumpGatePrefix,
             detailGate: detailGate,
             detailKnee: (low: detailKnee.0, high: detailKnee.1),
             detailSigma: detailSigma)
@@ -451,7 +455,8 @@ case "image":
         forceColumns: forceColumns, forceRows: forceRows,
         detailGate: detailGate,
         detailKnee: (low: detailKnee.0, high: detailKnee.1),
-        detailSigma: detailSigma)
+        detailSigma: detailSigma,
+        dumpGatePrefix: dumpGatePrefix)
 
     let t0 = Date()
     let result = try DenoiseImageRunner.run(request, model: model, metal: engine, progress: progress)
@@ -643,7 +648,7 @@ case "capabilities":
     var info: [String: Any] = [
         "tool": ["name": "ansel-denoise-swift", "protocol": 2],
         "features": ["image", "image-dng", "image-dng-dual-raw", "noise", "estimate-noise",
-                     "look-nlmf", "detail-gate", "detail-knee", "detail-sigma",
+                     "look-nlmf", "detail-gate", "detail-knee", "detail-sigma", "dump-gate",
                      "tile", "batch", "bench", "info", "gpu"],
         "cfaPatterns": ["rggb", "bggr", "grbg", "gbrg"],
         "inputLayout": "float32-planar-mosaic",
