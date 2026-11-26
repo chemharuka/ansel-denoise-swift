@@ -163,7 +163,31 @@ public struct AnselDenoiseOptions: Sendable, Equatable {
     /// 本帧测得的 σ 自己定力度（0.70–0.85），所以 app 的默认路径不再发 `--strength 0.50`。
     public var strength: Double = 0.50
 
+    /// 564 — coherence-gated fine-band blend. Defaults are the engine's measured look;
+    /// `detailGate == 0` is the historical blend. Kept on the host side so an experiment
+    /// can turn the gate down without rebuilding the tool.
+    public var detailGate: Double = 0.85
+    public var detailKneeLow: Double = 1.05
+    public var detailKneeHigh: Double = 1.25
+    public var detailSigma: Double = 1.5
+
     public init() {}
+
+    /// Only send the new flags when they differ from the tool's defaults, so an older
+    /// binary (which rejects unknown flags) keeps working on the default path.
+    var detailArguments: [String] {
+        var out: [String] = []
+        if detailGate != 0.85 {
+            out += ["--detail-gate", String(format: "%.9g", detailGate)]
+        }
+        if detailKneeLow != 1.05 || detailKneeHigh != 1.25 {
+            out += ["--detail-knee", String(format: "%.9g,%.9g", detailKneeLow, detailKneeHigh)]
+        }
+        if detailSigma != 1.5 {
+            out += ["--detail-sigma", String(format: "%.9g", detailSigma)]
+        }
+        return out
+    }
 }
 
 public struct AnselDenoiseReport: Sendable, Equatable {
@@ -209,6 +233,13 @@ public struct AnselDenoiseDNGReport: Sendable, Equatable {
     /// Samples the network produced outside [0,1] and the tool clamped. Non-zero is normal.
     public let clampedNegatives: Int
     public let clampedOverOne: Int
+    /// 564 — gate setting and the mean fine-band weight it applied.
+    public let detailGate: Double
+    public let detailMeanWeight: Double
+    /// Knees and envelope box half-width the run reported (16 means a 33 px window).
+    public let detailKneeLow: Double
+    public let detailKneeHigh: Double
+    public let detailBoxPlanePixels: Double
 
     init?(response: [String: Any], output: URL) {
         func int(_ key: String) -> Int? { (response[key] as? NSNumber)?.intValue }
@@ -232,6 +263,11 @@ public struct AnselDenoiseDNGReport: Sendable, Equatable {
         self.outputBytes = int("outputBytes") ?? 0
         self.clampedNegatives = int("clampedNegatives") ?? 0
         self.clampedOverOne = int("clampedOverOne") ?? 0
+        self.detailGate = double("detailGate")
+        self.detailMeanWeight = double("detailMeanWeight")
+        self.detailKneeLow = double("detailKneeLow")
+        self.detailKneeHigh = double("detailKneeHigh")
+        self.detailBoxPlanePixels = double("detailBox")
     }
 }
 
@@ -353,6 +389,7 @@ public struct AnselDenoiseClient: Sendable {
                           "--sigma-scale", Self.csv(options.sigmaScale),
                           "--strength", String(format: "%.9g", options.strength)]
         }
+        arguments += options.detailArguments
         arguments += ["--json", "--out", output.path]
 
         let response = try runJSON(arguments: arguments)
@@ -415,6 +452,7 @@ public struct AnselDenoiseClient: Sendable {
             "--json",
             "--out", output.path,
         ]
+        arguments += options.detailArguments
         if options.useGPU { arguments.insert("--gpu", at: 3) }
 
         let response = try runJSON(arguments: arguments)

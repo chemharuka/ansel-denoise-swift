@@ -51,6 +51,11 @@ public struct DenoiseDNGRequest {
     public var autoStrength: Bool
     /// Per-pixel reduction of the blend towards the extremes of the tonal range.
     public var taper: BlendTaper
+    /// 564 — fine-band coherence gate. `0` reproduces the historical blend exactly.
+    public var detailGate: Double
+    public var detailKneeLow: Double
+    public var detailKneeHigh: Double
+    public var detailSigma: Double
     /// Measure the noise curve from the file's own mosaic.
     public var estimateNoise: Bool
     public var checkerboardNoise: Bool
@@ -75,6 +80,11 @@ public struct DenoiseDNGRequest {
     /// Comparing two runs in this domain answers the question the render cannot.
     public var dumpFieldPrefix: String?
 
+    public var detailKnee: (low: Double, high: Double) {
+        get { (detailKneeLow, detailKneeHigh) }
+        set { detailKneeLow = newValue.low; detailKneeHigh = newValue.high }
+    }
+
     public init(model: AnselDenoiseModel, metal: MetalConv?,
                 input: URL, output: URL,
                 a: [Double], b: [Double],
@@ -90,7 +100,11 @@ public struct DenoiseDNGRequest {
                 tableSampleTiles: Int = 12,
                 writerGrid: DNGRawWriter.TileGrid = DNGRawWriter.TileGrid(),
                 dualRaw: Bool = false,
-                dumpFieldPrefix: String? = nil) {
+                dumpFieldPrefix: String? = nil,
+                detailGate: Double = DetailGateOptions.standard.maxWeight,
+                detailKnee: (low: Double, high: Double) =
+                    (DetailGateOptions.standard.kneeLow, DetailGateOptions.standard.kneeHigh),
+                detailSigma: Double = DetailGateOptions.standard.sigma) {
         self.model = model
         self.metal = metal
         self.input = input
@@ -101,6 +115,10 @@ public struct DenoiseDNGRequest {
         self.strength = strength
         self.autoStrength = autoStrength
         self.taper = taper
+        self.detailGate = detailGate
+        self.detailKneeLow = detailKnee.low
+        self.detailKneeHigh = detailKnee.high
+        self.detailSigma = detailSigma
         self.estimateNoise = estimateNoise
         self.checkerboardNoise = checkerboardNoise
         self.budgetBytes = budgetBytes
@@ -174,6 +192,12 @@ public struct DenoiseDNGResult {
     public let sigma: Double
     /// Per-pixel reduction applied to `strength`.
     public let taper: BlendTaper
+    /// 564 — fine-band coherence gate parameters and mean applied weight.
+    public let detailGate: Double
+    public let detailMeanWeight: Double
+    public let detailKneeLow: Double
+    public let detailKneeHigh: Double
+    public let detailBoxPlanePixels: Double
 }
 
 public enum DenoiseDNGError: Error, CustomStringConvertible {
@@ -292,7 +316,10 @@ public enum DenoiseDNGPipeline {
             estimateNoise: request.estimateNoise,
             checkerboardNoise: request.checkerboardNoise,
             budgetBytes: budget,
-            forceColumns: request.forceColumns, forceRows: request.forceRows)
+            forceColumns: request.forceColumns, forceRows: request.forceRows,
+            detailGate: request.detailGate,
+            detailKnee: request.detailKnee,
+            detailSigma: request.detailSigma)
 
         let inferenceStart = Date()
         let denoised = try DenoiseImageRunner.denoiseMosaic(mosaic, width: width, height: height,
@@ -390,7 +417,12 @@ public enum DenoiseDNGPipeline {
             noiseModel: denoised.noiseModel,
             strength: denoised.strength,
             sigma: denoised.sigma,
-            taper: denoised.taper)
+            taper: denoised.taper,
+            detailGate: denoised.detailGate,
+            detailMeanWeight: denoised.detailMeanWeight,
+            detailKneeLow: denoised.detailKneeLow,
+            detailKneeHigh: denoised.detailKneeHigh,
+            detailBoxPlanePixels: denoised.detailBoxPlanePixels)
     }
 
     /// Write the two fields and a sidecar of what produced them. See `dumpFieldPrefix`.
@@ -417,6 +449,8 @@ public enum DenoiseDNGPipeline {
                           "shadow": denoised.taper.shadow,
                           "shadowLow": denoised.taper.shadowLow,
                           "shadowHigh": denoised.taper.shadowHigh],
+                "detailGate": denoised.detailGate,
+                "detailMeanWeight": denoised.detailMeanWeight,
             ]
             if let model = denoised.noiseModel {
                 obj["noise"] = ["a": model.a, "b": model.b, "blocks": model.blocks]

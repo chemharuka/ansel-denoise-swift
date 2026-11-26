@@ -18,7 +18,7 @@ call for experiments and benchmarks.
 $ ansel-denoise-swift capabilities
 {"tool":{"name":"ansel-denoise-swift","protocol":2},
  "features":["image","image-dng","image-dng-dual-raw","noise","estimate-noise","look-nlmf",
-             "tile","batch","bench","info","gpu"],
+             "detail-gate","detail-knee","detail-sigma","tile","batch","bench","info","gpu"],
  "cfaPatterns":["rggb","bggr","grbg","gbrg"],
  "gpu":"Apple M1 Max",
  "inputLayout":"float32-planar-mosaic","outputLayout":"float32-planar-mosaic",
@@ -57,6 +57,9 @@ metadata is the source's. Nothing about the picture's geometry is the host's bus
 | `--noise-sample checkerboard` | Half the blocks during estimation (every brightness level still represented). |
 | `--taper q` / `--taper-knee lo,hi` | Give up `q` of the blend weight towards the highlights (`0`, the default, keeps it). Knees default `0.05,0.25`. |
 | `--shadow-taper q` / `--shadow-knee lo,hi` | The mirror at the floor; knees default `0.002,0.02`. |
+| `--detail-gate W` | 564 — maximum fine-band weight put back where the input is coherent. Default `0.85`; `0` reproduces the historical blend exactly. |
+| `--detail-knee lo,hi` | Coherence knees in units of the self-normalized grain floor; default `1.05,1.25`. |
+| `--detail-sigma S` | Fine-band Gaussian sigma in plane pixels; default `1.5`. The envelope box is a 33 plane-px window (half-width 16). |
 | `--look nlmf` | The conditioning Photons' nonlocal denoiser uses, so the two engines can be compared: `--estimate-noise`, `--sigma-scale 1,1,1`, `--strength auto`, `--taper 0.18 --taper-knee 0.05,0.25`, `--shadow-taper 0.50 --shadow-knee 0.002,0.02`. Explicit flags still win. |
 | `--dump-field PREFIX` | Debug door: `PREFIX.i.f32` (normalized input), `PREFIX.d.f32` (final field), `PREFIX.field.json` (curve, weight, taper). |
 | `--budget-gb` | Memory ceiling override. Omit to derive it from installed RAM (2/3, or 50 % below 12 GB). |
@@ -86,6 +89,8 @@ Response:
  "noise":{"a":[6.7e-4,6.9e-4,6.5e-4],"b":[4.3e-6,5.0e-6,4.1e-6],"blocks":[14652,14652,14652]},
  "taper":{"highlight":0.18,"highlightLow":0.05,"highlightHigh":0.25,
           "shadow":0.5,"shadowLow":0.002,"shadowHigh":0.02},
+ "detailGate":0.85,"detailMeanWeight":0.12,
+ "detailKneeLow":1.05,"detailKneeHigh":1.25,"detailBox":16,
  "inputLayout":"dng-cfa","outputLayout":"dng-cfa"}
 ```
 
@@ -106,6 +111,8 @@ The fields a host needs to decide anything:
 | `autoStrength` / `strength` | Whether the weight was derived from the curve, and the value actually used. |
 | `sigma` | Green-plane sigma at 5 % brightness that `autoStrength` keyed on. |
 | `taper` | The per-pixel weight reduction that was applied; all zeros/high knees mean the historical frame-wide blend. |
+| `detailGate` / `detailMeanWeight` | Maximum fine-band gate weight, and the mean weight actually applied. `0` on both is the historical blend. |
+| `detailKneeLow` / `detailKneeHigh` / `detailBox` | The gate that actually ran: knees in grain-floor units, and the envelope box **half-width** in plane pixels (`16` means a 33 px window). |
 | `hasAlternate` / `alternate` | `--dual-raw` only. `hasAlternate: true` and `alternate: "denoised"` mean the file carries a second full-res raw; `alternateBytes` / `alternateTiles` size it. Without the flag they read `false` / `null` / `0`. |
 
 ### Measure the curve — `noise`

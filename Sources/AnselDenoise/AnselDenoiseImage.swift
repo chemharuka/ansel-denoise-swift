@@ -46,6 +46,14 @@ public struct DenoiseImageRequest: Sendable {
     /// Per-pixel reduction of the blend towards the highlights and the floor. `identity` keeps the
     /// historical frame-wide weight, bit for bit.
     public var taper: BlendTaper
+    /// 564 — fraction of the residual's fine band to put back where the input is coherent.
+    /// `0` turns the gate off and reproduces the historical `i + s·(d − i)` loop exactly.
+    public var detailGate: Double
+    /// Coherence knees for the detail gate, in units of `sigma(x)`.
+    public var detailKneeLow: Double
+    public var detailKneeHigh: Double
+    /// Fine-band Gaussian sigma, in plane pixels.
+    public var detailSigma: Double
     /// Measure the noise curve from this image instead of trusting `a`/`b`.
     ///
     /// With this on, `a` and `b` are replaced by the measured curve, and the sigma calibration that
@@ -61,12 +69,21 @@ public struct DenoiseImageRequest: Sendable {
     public var forceColumns: Int?
     public var forceRows: Int?
 
+    public var detailKnee: (low: Double, high: Double) {
+        get { (detailKneeLow, detailKneeHigh) }
+        set { detailKneeLow = newValue.low; detailKneeHigh = newValue.high }
+    }
+
     public init(input: URL, output: URL, width: Int, height: Int,
                 a: [Double], b: [Double], sigmaScale: [Double] = [2.82, 3.94, 2.96],
                 cfa: String = "rggb", useGPU: Bool = true, strength: Double = 0.85,
                 autoStrength: Bool = false, taper: BlendTaper = .identity,
                 estimateNoise: Bool = false, checkerboardNoise: Bool = false,
-                budgetBytes: Int? = nil, forceColumns: Int? = nil, forceRows: Int? = nil) {
+                budgetBytes: Int? = nil, forceColumns: Int? = nil, forceRows: Int? = nil,
+                detailGate: Double = DetailGateOptions.standard.maxWeight,
+                detailKnee: (low: Double, high: Double) =
+                    (DetailGateOptions.standard.kneeLow, DetailGateOptions.standard.kneeHigh),
+                detailSigma: Double = DetailGateOptions.standard.sigma) {
         self.input = input
         self.output = output
         self.width = width
@@ -79,6 +96,10 @@ public struct DenoiseImageRequest: Sendable {
         self.strength = strength
         self.autoStrength = autoStrength
         self.taper = taper
+        self.detailGate = detailGate
+        self.detailKneeLow = detailKnee.low
+        self.detailKneeHigh = detailKnee.high
+        self.detailSigma = detailSigma
         self.estimateNoise = estimateNoise
         self.checkerboardNoise = checkerboardNoise
         self.budgetBytes = budgetBytes
@@ -114,6 +135,14 @@ public struct DenoiseImageResult: Sendable {
     public let sigma: Double
     /// Per-pixel reduction applied to `strength`.
     public let taper: BlendTaper
+    /// 564 — maximum fine-band weight the coherence gate was allowed to apply.
+    public let detailGate: Double
+    /// Mean gate weight over the frame. Zero when the gate is off or the frame is pure noise.
+    public let detailMeanWeight: Double
+    /// Knees the gate ran with, and the envelope box half-width in plane pixels.
+    public let detailKneeLow: Double
+    public let detailKneeHigh: Double
+    public let detailBoxPlanePixels: Double
 }
 
 public enum DenoiseImageError: Error, CustomStringConvertible {
@@ -337,7 +366,29 @@ public enum DenoiseImageRunner {
         // whole weight, highlights give up a fraction, and the floor holds back the most. With
         // `taper == .identity` the factor is exactly 1 everywhere, so this reduces to the
         // historical `in + s·(d − in)` bit for bit.
-        if sBase < 1 || request.taper != .identity {
+        //
+        // 564 adds a per-pixel coherence gate on top of that weight. It only changes the fine
+        // band of the residual, and only where the *input* — not the residual — is coherent.
+        // `detailGate == 0` skips the whole thing and runs the historical loop below.
+        var detailMeanWeight = 0.0
+        if request.detailGate > 0 && sBase > 0 {
+            // `acc` is dead once `result` is built; `wsum` is dead too, so reuse it for the
+            // per-sample sigma lookup rather than allocating another 60 MP array.
+            acc = []
+            DetailGate.fillSigma(&wsum, input: mosaic, width: W, height: H,
+                                 a: a, b: b, cfa: request.cfa)
+            let gateStart = Date()
+            detailMeanWeight = DetailGate.applyMosaic(
+                input: mosaic, output: &result, width: W, height: H,
+                sigma: wsum, cfa: request.cfa, strength: sBase, taper: request.taper,
+                options: DetailGateOptions(maxWeight: request.detailGate,
+                                           kneeLow: request.detailKneeLow,
+                                           kneeHigh: request.detailKneeHigh,
+                                           sigma: request.detailSigma))
+            progress?(String(format: "detail gate %.2f, mean weight %.3f, %.2f s",
+                             request.detailGate, detailMeanWeight,
+                             Date().timeIntervalSince(gateStart)))
+        } else if sBase < 1 || request.taper != .identity {
             for i in 0..<W * H where wsum[i] > 0 {
                 let s = sBase * request.taper.factor(for: mosaic[i])
                 result[i] = mosaic[i] + s * (result[i] - mosaic[i])
@@ -370,7 +421,12 @@ public enum DenoiseImageRunner {
                                   noiseModel: noiseModel,
                                   strength: strength,
                                   sigma: sigma,
-                                  taper: request.taper)
+                                  taper: request.taper,
+                                  detailGate: request.detailGate,
+                                  detailMeanWeight: detailMeanWeight,
+                                  detailKneeLow: request.detailKneeLow,
+                                  detailKneeHigh: request.detailKneeHigh,
+                                  detailBoxPlanePixels: DetailGate.boxPlanePixels)
     }
 
     /// Drop the padding added on the right and bottom before the forward pass.

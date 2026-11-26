@@ -9,6 +9,7 @@
 //    image   <model> <in.dng|in.f32> [--width W --height H] [--a r,g,b] [--b r,g,b]
 //            [--cfa rggb] [--gpu] [--strength S|auto] [--estimate-noise] [--look nlmf]
 //            [--taper q] [--taper-knee lo,hi] [--shadow-taper q] [--shadow-knee lo,hi]
+//            [--detail-gate W] [--detail-knee lo,hi] [--detail-sigma S]
 //            [--budget-gb G] [--dual-raw] [--dump-field PREFIX] [--split CxR]
 //            --out <out.dng|out.f32> [--json]
 //        Whole-image entry point: plans for memory, splits the few times it can,
@@ -270,6 +271,25 @@ case "image":
         taper.shadowHigh = knee[1]
     }
 
+    // 564 — coherence-gated fine-band blend. All three are optional; their defaults
+    // are the measured look. `--detail-gate 0` is the exact historical blend.
+    var detailGate = DetailGateOptions.standard.maxWeight
+    if let s = flag("--detail-gate") {
+        guard let v = Double(s) else { die("--detail-gate wants a number, got \(s)") }
+        detailGate = v
+    }
+    var detailKnee = (DetailGateOptions.standard.kneeLow,
+                      DetailGateOptions.standard.kneeHigh)
+    if let knee = flag("--detail-knee").map(parseDoubles) {
+        guard knee.count == 2 else { die("--detail-knee wants lo,hi") }
+        detailKnee = (knee[0], knee[1])
+    }
+    var detailSigma = DetailGateOptions.standard.sigma
+    if let s = flag("--detail-sigma") {
+        guard let v = Double(s) else { die("--detail-sigma wants a number, got \(s)") }
+        detailSigma = v
+    }
+
     let model = try AnselDenoiseModel(contentsOf: URL(fileURLWithPath: args[1]))
     var engine: MetalConv?
     if hasFlag("--gpu") { engine = try MetalConv() }
@@ -309,7 +329,10 @@ case "image":
             expectedWidth: flag("--width").flatMap(Int.init),
             expectedHeight: flag("--height").flatMap(Int.init),
             dualRaw: hasFlag("--dual-raw"),
-            dumpFieldPrefix: flag("--dump-field"))
+            dumpFieldPrefix: flag("--dump-field"),
+            detailGate: detailGate,
+            detailKnee: (low: detailKnee.0, high: detailKnee.1),
+            detailSigma: detailSigma)
 
         let result = try DenoiseDNGPipeline.run(request, progress: progress)
 
@@ -369,6 +392,11 @@ case "image":
                           "shadow": result.taper.shadow,
                           "shadowLow": result.taper.shadowLow,
                           "shadowHigh": result.taper.shadowHigh],
+                "detailGate": result.detailGate,
+                "detailMeanWeight": result.detailMeanWeight,
+                "detailKneeLow": result.detailKneeLow,
+                "detailKneeHigh": result.detailKneeHigh,
+                "detailBox": result.detailBoxPlanePixels,
             ])
         } else {
             let summary = [
@@ -420,7 +448,10 @@ case "image":
         estimateNoise: estimateNoise,
         checkerboardNoise: checkerboardNoise,
         budgetBytes: budgetBytes,
-        forceColumns: forceColumns, forceRows: forceRows)
+        forceColumns: forceColumns, forceRows: forceRows,
+        detailGate: detailGate,
+        detailKnee: (low: detailKnee.0, high: detailKnee.1),
+        detailSigma: detailSigma)
 
     let t0 = Date()
     let result = try DenoiseImageRunner.run(request, model: model, metal: engine, progress: progress)
@@ -451,6 +482,11 @@ case "image":
             "autoStrength": autoStrength,
             "strength": result.strength,
             "sigma": result.sigma,
+            "detailGate": result.detailGate,
+            "detailMeanWeight": result.detailMeanWeight,
+            "detailKneeLow": result.detailKneeLow,
+            "detailKneeHigh": result.detailKneeHigh,
+            "detailBox": result.detailBoxPlanePixels,
         ])
     } else {
         FileHandle.standardError.write(Data(String(
@@ -607,7 +643,8 @@ case "capabilities":
     var info: [String: Any] = [
         "tool": ["name": "ansel-denoise-swift", "protocol": 2],
         "features": ["image", "image-dng", "image-dng-dual-raw", "noise", "estimate-noise",
-                     "look-nlmf", "tile", "batch", "bench", "info", "gpu"],
+                     "look-nlmf", "detail-gate", "detail-knee", "detail-sigma",
+                     "tile", "batch", "bench", "info", "gpu"],
         "cfaPatterns": ["rggb", "bggr", "grbg", "gbrg"],
         "inputLayout": "float32-planar-mosaic",
         "outputLayout": "float32-planar-mosaic",
